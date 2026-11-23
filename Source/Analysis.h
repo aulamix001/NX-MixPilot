@@ -23,7 +23,7 @@ inline float frequency(int edge)
     return 20.0f * std::pow(1000.0f, static_cast<float>(edge) / bands);
 }
 
-enum Role { automatic, focus, bass, drums, music };
+enum Role { automatic, focus, bass, drums, music, backingVocal, harmony, auxiliaryPercussion, ambience };
 
 struct Reading
 {
@@ -185,9 +185,20 @@ inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float r
         return {};
     float offset = 0;
     if (mode == GainMode::musical)
-        offset = role == focus ? 0.0f
-            : role == bass || (role == automatic && bassHeavy(reading)) ? -3.0f
-            : role == drums ? -2.0f : -5.0f;
+    {
+        switch (role)
+        {
+            case focus: offset = 0; break;
+            case bass: offset = -3; break;
+            case drums: offset = -2; break;
+            case backingVocal: offset = -6; break;
+            case harmony: offset = -7; break;
+            case auxiliaryPercussion: offset = -9; break;
+            case ambience: offset = -12; break;
+            case automatic: offset = bassHeavy(reading) ? -3.0f : -5.0f; break;
+            case music: offset = -5; break;
+        }
+    }
     const float wanted = reference + offset - reading.rms;
     const float safe = -headroom - reading.peak;
     const float trim = std::clamp(std::min(wanted, safe), -maxTrim, maxTrim);

@@ -42,6 +42,23 @@ No balanço musical, a pista de **Foco** continua sendo a âncora. A análise to
 4. Use **Ouvir B** para escutar o ajuste e **Voltar a A** para retornar aos trims anteriores. A audição B usa a diferença de nível do próprio ajuste. Clique em **Aplicar trim** durante a reprodução para gravar os valores, ou em **Cancelar prévia** para descartá-los. **Desfazer** restaura os valores anteriores enquanto a instância HUB existir. O estado do projeto guarda os trims aplicados. O histórico de desfazer dura até a remoção da instância HUB ou o fechamento do projeto.
 5. O trim é um ganho linear com rampa de 35 ms. Ele preserva a forma dos transientes e a relação entre picos e RMS depois da rampa. A margem usa **pico de amostra** recente, em dBFS. RMS, LUFS e true peak são medidas distintas. Este protótipo mede RMS e pico de amostra. A margem é uma proteção baseada no trecho medido e pode mudar com trechos mais fortes, processamento posterior ou a soma de pistas no bus.
 
+## Hierarquia de mix
+
+Em modo **Track**, deixe o papel em **Auto** ou **Acompanhamento** e escolha o tipo de acompanhamento. No **HUB**, escolha a pista **Principal** e clique em **ANALYZER**. O plugin usa o nível atual da Principal como âncora relativa em RMS. Estes são pontos de partida do MixPilot, ajustados pelos limites de trim e pico de amostra:
+
+| Papel | Diferença nominal em relação à Principal |
+| --- | ---: |
+| Principal | 0 dB |
+| Bateria | −2 dB |
+| Baixo | −3 dB |
+| Acompanhamento padrão | −5 dB |
+| Voz de apoio | −6 dB |
+| Harmonia | −7 dB |
+| Percussão auxiliar | −9 dB |
+| Ambiência / FX | −12 dB |
+
+Os valores da tabela são escolhas de mixagem. A recomendação [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770) define a medição de loudness e true peak, e a [EBU R128](https://tech.ebu.ch/publications/r128) aplica loudness ao programa de áudio. Essas referências tratam de outras medições. O MixPilot usa RMS e pico de amostra na análise de pistas descrita acima.
+
 ## Balanço musical e análise tonal
 
 - Para testar o **Balanço musical**, marque uma pista ativa como **Foco**. O nível atual do foco é a âncora. Os outros níveis são sugeridos por categoria e limitados pela margem. O modo **Auto** identifica predominância de graves a partir da energia espectral. A escolha do foco e a classificação das demais funções musicais continuam editáveis no Track. O protótipo ainda não identifica instrumentos, gênero ou intenção de mixagem automaticamente.

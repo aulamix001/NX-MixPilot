@@ -50,6 +50,15 @@ int main()
     const auto technical = nx::suggestTrim(quiet, nx::GainMode::calibration, -18, nx::automatic, 12, 3);
     const auto musical = nx::suggestTrim(quiet, nx::GainMode::musical, -18, nx::music, 12, 3);
     expect(near(technical.trim, 6) && near(musical.trim, 1), "Musical balance must retain the role offset.");
+    auto profile = [&](nx::Role role)
+    {
+        return nx::suggestTrim(quiet, nx::GainMode::musical, -18, role, 12, 3).trim;
+    };
+    expect(near(profile(nx::backingVocal), 0) && near(profile(nx::harmony), -1)
+        && near(profile(nx::auxiliaryPercussion), -3) && near(profile(nx::ambience), -6),
+        "Support roles must preserve the intended relative hierarchy.");
+    expect(near(nx::suggestTrim(quiet, nx::GainMode::calibration, -18, nx::ambience, 12, 3).trim, 6),
+        "Musical roles must not affect the technical calibration reference.");
     expect(nx::bassHeavy(tone(94, -24)) && !nx::bassHeavy(measured), "Auto role must distinguish dominant lows.");
 
     auto transient = quiet;

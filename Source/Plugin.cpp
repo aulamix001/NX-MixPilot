@@ -111,6 +111,11 @@ public:
             registry().tracks[static_cast<std::size_t>(slot)] = nullptr;
     }
 
+    static juce::StringArray supportNames()
+    {
+        return {utf8("Padrão"), "Voz de apoio", "Harmonia", utf8("Percussão auxiliar"), utf8("Ambiência / FX")};
+    }
+
     static juce::AudioProcessorValueTreeState::ParameterLayout layout()
     {
         using namespace juce;
@@ -132,6 +137,8 @@ public:
         result.add(std::make_unique<AudioParameterFloat>(ParameterID{"headroom", 1}, "Margem de pico (dB)",
                         NormalisableRange<float>{0, 18, 0.1f}, 3));
         result.add(std::make_unique<AudioParameterBool>(ParameterID{"bypass", 1}, "Bypass", false));
+        result.add(std::make_unique<AudioParameterChoice>(ParameterID{"support", 1},
+                        "Tipo de acompanhamento", supportNames(), 0));
         return result;
     }
 
@@ -139,6 +146,14 @@ public:
     int session() const { return static_cast<int>(value("session")); }
     bool hub() const { return value("instance") > 0.5f; }
     nx::Role role() const { return static_cast<nx::Role>(static_cast<int>(value("role"))); }
+    nx::Role musicalRole() const
+    {
+        const auto base = role();
+        const auto variant = static_cast<int>(value("support"));
+        return variant > 0 && (base == nx::automatic || base == nx::music)
+            ? static_cast<nx::Role>(nx::backingVocal + variant - 1) : base;
+    }
+
     int group() const { return static_cast<int>(value("group")); }
     void updateTrackProperties(const TrackProperties& properties) override
     {
@@ -318,6 +333,7 @@ public:
         };
         attachChoice(instance, "instance", {"Track", "HUB"});
         attachChoice(role, "role", {"Auto", "Foco", "Baixo", "Bateria", "Acompanhamento"});
+        attachChoice(support, "support", Processor::supportNames());
         attachChoice(operation, "operation", {utf8("Calibração técnica"), utf8("Balanço musical")});
         attachSlider(session, "session", "");
         attachSlider(group, "group", "");
@@ -419,6 +435,7 @@ public:
         pick.setBounds(168, 114, 146, 26);
         group.setBounds(plugin.hub() ? 222 : 459, plugin.hub() ? 114 : 75, 125, 26);
         role.setBounds(267, 75, 122, 27);
+        support.setBounds(201, 574, 220, 28);
         trim.setBounds(807, 494, 128, 130);
         limit.setBounds(trim.getBounds());
 
@@ -520,8 +537,9 @@ public:
         {
             label(g, utf8("BALANÇO LOCAL"), 26, 407, 630, 23, 17, ink, true);
             drawRows(g);
-            label(g, utf8("Auto detecta graves predominantes. Use Foco para definir a prioridade musical no HUB."),
+            label(g, utf8("Defina a hierarquia no HUB. O tipo abaixo se aplica a Auto ou Acompanhamento."),
                   28, 532, 641, 27, 14);
+            label(g, "Tipo de acompanhamento", 28, 574, 171, 28, 13);
             label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);
             label(g, utf8("Sessão ") + juce::String(plugin.session()) + "  /  Grupo " + juce::String(plugin.group()),
                   721, 436, 297, 25, 15, ink);
@@ -824,6 +842,8 @@ private:
         group.setVisible(!isHub || scope.getSelectedId() == 2);
         group.setBounds(isHub ? 222 : 459, isHub ? 114 : 75, 125, 26);
         role.setVisible(!isHub);
+        support.setVisible(!isHub);
+        support.setEnabled(plugin.role() == nx::automatic || plugin.role() == nx::music);
         trim.setVisible(!isHub);
 
         localCurrent = plugin.measurement.read(local, plugin.session());
@@ -831,7 +851,7 @@ private:
         focusRow = otherRow = -1;
         auto append = [&](Processor& track)
         {
-            TrackRow row {track.identity, track.group(), track.role(), track.value("trim"), false, {}, {}, 0, track.displayName()};
+            TrackRow row {track.identity, track.group(), track.musicalRole(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
             rows.push_back(row);
@@ -1224,7 +1244,7 @@ private:
     int firstRow = 0;
     Processor& plugin;
     GlassLook glass;
-    juce::ComboBox instance, role, operation, scope, pick;
+    juce::ComboBox instance, role, operation, scope, pick, support;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::TextButton, visibleRows> principalButtons;
