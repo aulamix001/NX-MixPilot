@@ -28,7 +28,7 @@ ctest --preset dsp-tests
 
 Em **Track**, o editor calibra a pista aberta e oferece controle rotativo de trim. No **HUB**, os medidores do mix bus, o diagnóstico tonal e a tabela mostram as medições da sessão. Use a roda do mouse sobre a tabela para percorrer mais pistas.
 
-No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZER**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
+No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZER**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação. O ponto verde na coluna Trim identifica o ajuste aplicado pelo MixPilot durante a sessão.
 
 Clique em **Principal** na linha da pista de referência no HUB para selecioná-la e ativar o **Balanço musical**. Depois, com as pistas em reprodução, clique em **ANALYZER**.
 

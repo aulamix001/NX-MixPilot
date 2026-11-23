@@ -4,6 +4,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace
@@ -69,6 +70,7 @@ struct Change
 {
     unsigned identity;
     float previous, next;
+    std::optional<float> previousApplied;
 };
 
 class Processor;
@@ -272,6 +274,7 @@ public:
     std::atomic<int> previewSession {0};
     unsigned identity = 0;
     int slot = -1;
+    std::optional<float> lastAppliedTrim; // Message thread.
     std::vector<std::vector<Change>> history; // Message thread.
     unsigned previewOwner = 0; // Accessed under the registry mutex.
 
@@ -293,6 +296,7 @@ struct TrackRow
     nx::GainSuggestion proposed;
     juce::uint32 timestamp = 0;
     juce::String name;
+    bool adjusted = false;
 };
 
 Processor* findTrack(unsigned identity)
@@ -805,9 +809,14 @@ private:
                 : frozen == pending.end() ? dash : number(frozen->next);
             label(g, suggestion, 413, top, 74, 28, 13, frozen != pending.end() ? cyan : muted);
             label(g, number(row.trim), 488, top, 65, 28, 13, ink);
+            if (row.adjusted)
+            {
+                g.setColour(juce::Colour(0xff60e995));
+                g.fillEllipse(536.0f, y + 11.0f, 6.0f, 6.0f);
+            }
             const juce::String state = !signal ? "Sem sinal" : !row.reading.active() ? "Medindo"
                 : row.proposed.headroomUnmet ? "Margem insuficiente"
-                : row.proposed.headroomLimited ? "Limitado pelo pico" : "Ativo";
+                : row.proposed.headroomLimited ? "Limitado pelo pico" : row.adjusted ? "Ajustada" : "Ativo";
             label(g, state, 557, top, 123, 28, 12, row.proposed.headroomLimited ? amber : muted);
         }
     }
@@ -854,6 +863,7 @@ private:
             TrackRow row {track.identity, track.group(), track.musicalRole(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
+            row.adjusted = track.lastAppliedTrim && std::abs(*track.lastAppliedTrim - row.trim) <= 0.011f;
             rows.push_back(row);
         };
         if (isHub)
@@ -1112,7 +1122,7 @@ private:
                 continue;
             }
             if (std::abs(row.trim - next) >= 0.009f)
-                pending.push_back({row.identity, row.trim, next});
+                pending.push_back({row.identity, row.trim, next, {}});
         }
         if (automatic)
         {
@@ -1203,8 +1213,13 @@ private:
             status = utf8("Aplicação cancelada. Capture novamente com sinal e margem suficientes.");
             return;
         }
-        for (const auto& change : pending)
-            findTrack(change.identity)->setTrim(change.next);
+        for (auto& change : pending)
+        {
+            auto* track = findTrack(change.identity);
+            change.previousApplied = track->lastAppliedTrim;
+            track->setTrim(change.next);
+            track->lastAppliedTrim = change.next;
+        }
         clearPreview();
         const auto count = pending.size();
         plugin.history.push_back(std::move(pending));
@@ -1230,6 +1245,7 @@ private:
                 || std::abs(track->value("trim") - change.next) > 0.011f)
                 return false;
             track->setTrim(change.previous);
+            track->lastAppliedTrim = change.previousApplied;
             return true;
         }), batch.end());
         const auto remaining = batch.size();
