@@ -178,8 +178,19 @@ struct GainSuggestion
     bool headroomUnmet = false;
 };
 
+struct PeakRange
+{
+    float minimum;
+    float maximum;
+};
+
+inline constexpr std::array<PeakRange, 10> instrumentPeakRanges {{
+    {-12, -6}, {-12, -6}, {-20, -12}, {-12, -6}, {-18, -10},
+    {-18, -10}, {-24, -12}, {-18, -8}, {-12, -6}, {-18, -10}
+}};
+
 inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float reference,
-                                  Role role, float maxTrim, float headroom)
+                                  Role role, float maxTrim, float headroom, int peakProfile = 0)
 {
     if (!reading.active())
         return {};
@@ -199,7 +210,13 @@ inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float r
             case music: offset = -5; break;
         }
     }
-    const float wanted = reference + offset - reading.rms;
+    float wanted = reference + offset - reading.rms;
+    if (peakProfile > 0 && peakProfile <= static_cast<int>(instrumentPeakRanges.size())
+        && !(mode == GainMode::musical && role == focus))
+    {
+        const auto range = instrumentPeakRanges[static_cast<std::size_t>(peakProfile - 1)];
+        wanted = std::clamp(wanted, range.minimum - reading.peak, range.maximum - reading.peak);
+    }
     const float safe = -headroom - reading.peak;
     const float trim = std::clamp(std::min(wanted, safe), -maxTrim, maxTrim);
     return {trim, wanted > safe, trim > safe + 0.001f};

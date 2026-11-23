@@ -42,6 +42,10 @@ No balanço musical, a pista de **Foco** continua sendo a âncora. A análise to
 4. Use **Ouvir B** para escutar o ajuste e **Voltar a A** para retornar aos trims anteriores. A audição B usa a diferença de nível do próprio ajuste. Clique em **Aplicar trim** durante a reprodução para gravar os valores, ou em **Cancelar prévia** para descartá-los. **Desfazer** restaura os valores anteriores enquanto a instância HUB existir. O estado do projeto guarda os trims aplicados. O histórico de desfazer dura até a remoção da instância HUB ou o fechamento do projeto.
 5. O trim é um ganho linear com rampa de 35 ms. Ele preserva a forma dos transientes e a relação entre picos e RMS depois da rampa. A margem usa **pico de amostra** recente, em dBFS. RMS, LUFS e true peak são medidas distintas. Este protótipo mede RMS e pico de amostra. A margem é uma proteção baseada no trecho medido e pode mudar com trechos mais fortes, processamento posterior ou a soma de pistas no bus.
 
+## Referências de pico por instrumento
+
+No editor **Track**, selecione o instrumento em **Referência de pico por instrumento**. A faixa aparece em dBFS de pico de amostra. O **ANALYZER** usa essa faixa para orientar o trim individual. Os limites de trim e headroom têm prioridade. Em Balanço musical, a pista de foco preserva sua função de âncora. A calibração em grupo com ganho comum prioriza preservar os níveis relativos. No HUB, o indicador de −6 dBFS é uma referência visual para o bus pré-master.
+
 ## Hierarquia de mix
 
 Em modo **Track**, deixe o papel em **Auto** ou **Acompanhamento** e escolha o tipo de acompanhamento. No **HUB**, escolha a pista **Principal** e clique em **ANALYZER**. O plugin usa o nível atual da Principal como âncora relativa em RMS. Estes são pontos de partida do MixPilot, ajustados pelos limites de trim e pico de amostra:

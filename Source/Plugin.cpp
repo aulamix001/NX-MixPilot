@@ -113,6 +113,13 @@ public:
             registry().tracks[static_cast<std::size_t>(slot)] = nullptr;
     }
 
+    static juce::StringArray peakNames()
+    {
+        return {utf8("Sem referência de pico"), "Kick", "Snare", utf8("Hi-hat / Percussão"), "Baixo",
+                "Piano / Teclados", "Guitarras", "Pads / Strings", "Sintetizadores",
+                "Vocal principal", "Backing vocals"};
+    }
+
     static juce::StringArray supportNames()
     {
         return {utf8("Padrão"), "Voz de apoio", "Harmonia", utf8("Percussão auxiliar"), utf8("Ambiência / FX")};
@@ -141,6 +148,8 @@ public:
         result.add(std::make_unique<AudioParameterBool>(ParameterID{"bypass", 1}, "Bypass", false));
         result.add(std::make_unique<AudioParameterChoice>(ParameterID{"support", 1},
                         "Tipo de acompanhamento", supportNames(), 0));
+        result.add(std::make_unique<AudioParameterChoice>(ParameterID{"peakReference", 1},
+                        utf8("Referência de pico"), peakNames(), 0));
         return result;
     }
 
@@ -297,6 +306,7 @@ struct TrackRow
     juce::uint32 timestamp = 0;
     juce::String name;
     bool adjusted = false;
+    int peakProfile = 0;
 };
 
 Processor* findTrack(unsigned identity)
@@ -337,6 +347,7 @@ public:
         };
         attachChoice(instance, "instance", {"Track", "HUB"});
         attachChoice(role, "role", {"Auto", "Foco", "Baixo", "Bateria", "Acompanhamento"});
+        attachChoice(peakReference, "peakReference", Processor::peakNames());
         attachChoice(support, "support", Processor::supportNames());
         attachChoice(operation, "operation", {utf8("Calibração técnica"), utf8("Balanço musical")});
         attachSlider(session, "session", "");
@@ -440,7 +451,8 @@ public:
         pick.setBounds(168, 114, 146, 26);
         group.setBounds(plugin.hub() ? 222 : 459, plugin.hub() ? 114 : 75, 125, 26);
         role.setBounds(267, 75, 122, 27);
-        support.setBounds(201, 574, 220, 28);
+        support.setBounds(27, 574, 270, 28);
+        peakReference.setBounds(323, 574, 352, 28);
         trim.setBounds(807, 494, 128, 130);
         limit.setBounds(trim.getBounds());
 
@@ -543,8 +555,16 @@ public:
             label(g, utf8("BALANÇO LOCAL"), 26, 407, 630, 23, 17, ink, true);
             drawRows(g);
             label(g, utf8("Defina a hierarquia no HUB. O tipo abaixo se aplica a Auto ou Acompanhamento."),
-                  28, 532, 641, 27, 14);
-            label(g, "Tipo de acompanhamento", 28, 574, 171, 28, 13);
+                  28, 526, 641, 25, 14);
+            label(g, "Tipo de acompanhamento", 28, 553, 270, 20, 12);
+            label(g, utf8("Referência de pico por instrumento"), 324, 553, 350, 20, 12);
+            const int profile = static_cast<int>(plugin.value("peakReference"));
+            if (profile > 0)
+            {
+                const auto range = nx::instrumentPeakRanges[static_cast<std::size_t>(profile - 1)];
+                label(g, number(range.minimum) + " a " + number(range.maximum) + " dBFS (pico)",
+                      325, 605, 348, 19, 12, cyan);
+            }
             label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);
             label(g, utf8("Sessão ") + juce::String(plugin.session()) + "  /  Grupo " + juce::String(plugin.group()),
                   721, 436, 297, 25, 15, ink);
@@ -651,6 +671,8 @@ private:
         metric("RMS de entrada", signal ? number(local.rms) + " dBFS" : dash, 190);
         metric(utf8("Pico de amostra · saída"), signal ? number(local.outputPeak) + " dBFS" : dash, 250);
         metric("Headroom", signal ? number(-local.outputPeak) + " dB" : dash, 310);
+        if (plugin.hub())
+            label(g, utf8("Pré-master · referência de pico: −6 dBFS"), 856, 363, 170, 23, 10, cyan);
     }
 
     static juce::Colour spectrumColour(const TrackRow& row)
@@ -859,6 +881,7 @@ private:
         group.setBounds(isHub ? 222 : 459, isHub ? 114 : 75, 125, 26);
         role.setVisible(!isHub);
         support.setVisible(!isHub);
+        peakReference.setVisible(!isHub);
         support.setEnabled(plugin.role() == nx::automatic || plugin.role() == nx::music);
         trim.setVisible(!isHub);
 
@@ -870,6 +893,7 @@ private:
             TrackRow row {track.identity, track.group(), track.musicalRole(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
+            row.peakProfile = static_cast<int>(track.value("peakReference"));
             row.adjusted = track.lastAppliedTrim && std::abs(*track.lastAppliedTrim - row.trim) <= 0.011f;
             rows.push_back(row);
         };
@@ -1057,7 +1081,7 @@ private:
         for (auto& row : rows)
             if (canSuggest(row))
                 row.proposed = nx::suggestTrim(row.reading, mode(), anchor, row.role,
-                                               plugin.value("limit"), plugin.value("headroom"));
+                                               plugin.value("limit"), plugin.value("headroom"), row.peakProfile);
     }
 
     void capture()
@@ -1268,7 +1292,7 @@ private:
     int firstRow = 0;
     Processor& plugin;
     GlassLook glass;
-    juce::ComboBox instance, role, operation, scope, pick, support;
+    juce::ComboBox instance, role, operation, scope, pick, support, peakReference;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
