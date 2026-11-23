@@ -24,6 +24,12 @@ cmake --build --preset dsp-tests
 ctest --preset dsp-tests
 ```
 
+## ANALYZE automático
+
+No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZE**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
+
+No balanço musical, a pista de **Foco** continua sendo a âncora. A análise tonal permanece visível no espectro para avaliação auditiva. Ela sinaliza sobreposições candidatas e deixa o áudio sem EQ automático.
+
 ## Calibração técnica
 
 1. Insira o plugin antes dos processadores que devem receber o nível calibrado. No Track, escolha a **Sessão** e, se aplicável, atribua um **Grupo**. Para evitar misturar projetos abertos no mesmo processo, use um número de sessão distinto para cada projeto.

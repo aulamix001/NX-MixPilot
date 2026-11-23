@@ -33,7 +33,7 @@ struct Measurement
         ++version;
     }
 
-    bool read(nx::Reading& reading, int group) const
+    bool read(nx::Reading& reading, int group, juce::uint32* timestamp = nullptr) const
     {
         const auto before = version.load();
         if ((before & 1u) || before == 0)
@@ -46,8 +46,13 @@ struct Measurement
         reading.position = position.load();
         for (int i = 0; i < nx::bands; ++i)
             reading.power[i] = power[i].load();
-        const auto age = juce::Time::getMillisecondCounter() - stamp.load();
-        return session.load() == group && age < 500 && before == version.load();
+        const auto published = stamp.load();
+        const auto age = juce::Time::getMillisecondCounter() - published;
+        if (session.load() != group || age >= 500 || before != version.load())
+            return false;
+        if (timestamp != nullptr)
+            *timestamp = published;
+        return true;
     }
 
     std::atomic<unsigned> version {0};
@@ -256,6 +261,7 @@ struct TrackRow
     bool current;
     nx::Reading reading;
     nx::GainSuggestion proposed;
+    juce::uint32 timestamp = 0;
 };
 
 Processor* findTrack(unsigned identity)
@@ -312,11 +318,22 @@ public:
         scope.setSelectedId(1);
         addAndMakeVisible(scope);
         addAndMakeVisible(pick);
+        configureButton(analyze, "ANALYZE", [this] { startAnalysis(); });
+        analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
+        analyze.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
+        analyze.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+        analyze.setTooltip(utf8("Analisa e aplica o trim individual de cada pista ativa da sessão."));
         configureButton(review, utf8("Capturar prévia"), [this] { capture(); });
         configureButton(apply, "Aplicar trim", [this] { commit(); });
         configureButton(audition, "Ouvir B", [this] { togglePreview(); });
         configureButton(undo, "Desfazer", [this] { undoLast(); });
-        configureButton(cancel, utf8("Cancelar prévia"), [this] { discard(utf8("Prévia cancelada.")); });
+        configureButton(cancel, "Cancelar", [this]
+        {
+            const bool wasAnalyzing = analyzing;
+            analyzing = false;
+            discard(wasAnalyzing ? utf8("Análise cancelada.") : utf8("Prévia cancelada."));
+            updateButtons();
+        });
         bypass.setButtonText("Bypass");
         addAndMakeVisible(bypass);
         bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -348,9 +365,10 @@ public:
         headroom.setBounds(588, 120, 143, 28);
         scope.setBounds(24, 120, 140, 28);
         pick.setBounds(174, 120, 180, 28);
-        review.setBounds(24, 604, 155, 32);
-        audition.setBounds(189, 604, 115, 32);
-        cancel.setBounds(314, 604, 150, 32);
+        analyze.setBounds(24, 604, 145, 32);
+        review.setBounds(179, 604, 155, 32);
+        audition.setBounds(344, 604, 115, 32);
+        cancel.setBounds(469, 604, 115, 32);
         undo.setBounds(690, 604, 120, 32);
         apply.setBounds(820, 604, 197, 32);
     }
@@ -538,17 +556,13 @@ private:
 
         const bool isHub = plugin.hub();
         for (auto* control : std::initializer_list<juce::Component*>{
-                  &operation, &reference, &headroom, &limit, &scope, &review, &apply, &cancel, &audition, &undo})
+                  &operation, &reference, &headroom, &limit, &scope, &analyze, &review, &apply, &cancel, &audition, &undo})
             control->setVisible(isHub);
         reference.setVisible(isHub && mode() == nx::GainMode::calibration);
         pick.setVisible(isHub && scope.getSelectedId() == 1);
         group.setVisible(!isHub || scope.getSelectedId() == 2);
         role.setVisible(!isHub);
         trim.setVisible(!isHub);
-        apply.setEnabled(!pending.empty());
-        audition.setEnabled(!pending.empty());
-        cancel.setEnabled(!pending.empty());
-        undo.setEnabled(!plugin.history.empty());
 
         localCurrent = plugin.measurement.read(local, plugin.session());
         rows.clear();
@@ -560,7 +574,7 @@ private:
                     if (track != nullptr && !track->hub() && track->session() == plugin.session())
                     {
                         TrackRow row {track->identity, track->group(), track->role(), track->value("trim"), false, {}, {}};
-                        row.current = track->eligible(plugin.session()) && track->measurement.read(row.reading, plugin.session());
+                        row.current = track->eligible(plugin.session()) && track->measurement.read(row.reading, plugin.session(), &row.timestamp);
                         rows.push_back(row);
                     }
         }
@@ -568,7 +582,57 @@ private:
             refreshHub();
         else
             tonalStatus = localCurrent ? "Espectro da entrada (dBFS por banda)" : "Reproduza um trecho com sinal.";
+        finishAnalysis();
+        updateButtons();
         repaint();
+    }
+
+    void updateButtons()
+    {
+        analyze.setToggleState(analyzing, juce::dontSendNotification);
+        analyze.setEnabled(plugin.value("bypass") < 0.5f);
+        review.setEnabled(!analyzing);
+        apply.setEnabled(!analyzing && !pending.empty());
+        audition.setEnabled(!analyzing && !pending.empty());
+        cancel.setEnabled(analyzing || !pending.empty());
+        undo.setEnabled(!analyzing && !plugin.history.empty());
+    }
+
+    std::array<float, 5> analysisSettings() const
+    {
+        return {plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
+                plugin.value("limit"), plugin.value("headroom")};
+    }
+
+    void startAnalysis()
+    {
+        if (analyzing || !plugin.hub() || plugin.value("bypass") > 0.5f)
+            return;
+        discard(utf8("ANALYZE  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa."));
+        requestedSettings = analysisSettings();
+        analysisStarted = juce::Time::getMillisecondCounter();
+        analyzing = true;
+        updateButtons();
+        repaint();
+    }
+
+    void finishAnalysis()
+    {
+        if (!analyzing)
+            return;
+        if (!plugin.hub() || plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
+        {
+            analyzing = false;
+            status = utf8("ANALYZE cancelado após alteração das configurações.");
+            return;
+        }
+        if (juce::Time::getMillisecondCounter() - analysisStarted < 1200)
+            return;
+
+        analyzing = false;
+        prepareChanges(true);
+        if (!pending.empty())
+            commit();
     }
 
     void refreshHub()
@@ -639,12 +703,25 @@ private:
     {
         discard({});
         timerCallback();
+        prepareChanges(false);
+    }
+
+    void prepareChanges(bool automatic)
+    {
         if (plugin.value("bypass") > 0.5f)
         {
             status = "Desative o bypass do HUB antes de capturar.";
             return;
         }
-        if (mode() == nx::GainMode::musical && focusRow < 0)
+        const auto fresh = [&](const TrackRow& row)
+        {
+            const auto elapsed = row.timestamp - analysisStarted;
+            return row.current && (!automatic || (elapsed >= 1000
+                && elapsed <= juce::Time::getMillisecondCounter() - analysisStarted));
+        };
+        const auto usable = [&](const TrackRow& row) { return fresh(row) && canSuggest(row); };
+        if (mode() == nx::GainMode::musical
+            && (focusRow < 0 || !fresh(rows[static_cast<std::size_t>(focusRow)])))
         {
             status = "Escolha uma pista de Foco e reproduza um trecho ativo.";
             return;
@@ -652,18 +729,18 @@ private:
         int skipped = 0;
         capturedSession = plugin.session();
         capturedHeadroom = plugin.value("headroom");
-        const int scopeId = scope.getSelectedId();
+        const int scopeId = automatic ? 3 : scope.getSelectedId();
         auto inScope = [&](const auto& row)
         {
             return scopeId == 1 ? row.identity == static_cast<unsigned>(pick.getSelectedId())
                 : scopeId == 2 ? row.group == plugin.group() : true;
         };
-        const bool commonCalibration = mode() == nx::GainMode::calibration && scopeId != 1;
+        const bool commonCalibration = !automatic && mode() == nx::GainMode::calibration && scopeId != 1;
         nx::GroupCalibration calibration(plugin.value("limit"), capturedHeadroom);
         if (commonCalibration)
         {
             for (const auto& row : rows)
-                if (inScope(row) && canSuggest(row))
+                if (inScope(row) && usable(row))
                     calibration.include(row.reading, row.trim);
             if (!calibration.possible())
             {
@@ -676,7 +753,7 @@ private:
         {
             if (!inScope(row))
                 continue;
-            if (!canSuggest(row) || (!commonCalibration && row.proposed.headroomUnmet))
+            if (!usable(row) || (!commonCalibration && row.proposed.headroomUnmet))
             {
                 ++skipped;
                 continue;
@@ -692,6 +769,13 @@ private:
             }
             if (std::abs(row.trim - next) >= 0.009f)
                 pending.push_back({row.identity, row.trim, next});
+        }
+        if (automatic)
+        {
+            status = pending.empty()
+                ? utf8("ANALYZE concluído sem ajustes. Confira o sinal, a referência e a margem de pico.")
+                : juce::String{};
+            return;
         }
         status = juce::String(commonCalibration ? utf8("Prévia de grupo: ajuste comum de ") + number(commonStep) + " dB. "
                                                 : juce::String(utf8("Prévia fixa: ")))
@@ -808,7 +892,7 @@ private:
     Processor& plugin;
     juce::ComboBox instance, role, operation, scope, pick;
     juce::Slider session, group, trim, reference, limit, headroom;
-    juce::TextButton review, apply, audition, undo, cancel;
+    juce::TextButton analyze, review, apply, audition, undo, cancel;
     juce::ToggleButton bypass;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
@@ -816,7 +900,9 @@ private:
     std::vector<TrackRow> rows;
     std::vector<Change> pending;
     nx::Reading local;
-    bool localCurrent = false, listening = false;
+    bool localCurrent = false, listening = false, analyzing = false;
+    std::array<float, 5> requestedSettings {};
+    juce::uint32 analysisStarted = 0;
     int focusRow = -1, otherRow = -1, capturedSession = 0;
     float capturedHeadroom = 0;
     juce::String status = "Reproduza um trecho representativo antes de capturar.";
