@@ -657,9 +657,13 @@ private:
     {
         if (row.role == nx::focus)
             return juce::Colour(cyan);
-        // Space consecutive track identities apart and reserve cyan for the principal.
-        const float hue = std::fmod(static_cast<float>(row.identity) * 0.618034f, 1.0f);
-        return juce::Colour::fromHSV(hue < 0.43f ? hue : hue * 0.86f + 0.14f, 0.61f, 0.98f, 1.0f);
+        constexpr std::array<juce::uint32, 10> palette {
+            0xffff77b6, 0xffae86ff, 0xff61e896, 0xffffbb60, 0xff8aa7ff,
+            0xffef7764, 0xffd7eb6c, 0xffdf8df2, 0xff52c8b3, 0xffffdcad
+        };
+        const auto index = static_cast<std::size_t>(row.identity - 1);
+        const auto shade = juce::Colour(palette[index % palette.size()]);
+        return (index / palette.size()) % 2 == 0 ? shade : shade.darker(0.25f);
     }
 
     void drawSpectrum(juce::Graphics& g) const
