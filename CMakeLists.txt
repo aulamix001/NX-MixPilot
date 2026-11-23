@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(NXMixPilot VERSION 0.1.22 LANGUAGES C CXX)
+project(NXMixPilot VERSION 0.2.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -26,7 +26,7 @@ if(NX_BUILD_PLUGINS)
         FORMATS VST3
         VST3_CATEGORIES Fx Analyzer
         PRODUCT_NAME "NX Audio MixPilot")
-    target_sources(NXMixPilot PRIVATE Source/Plugin.cpp Source/Analysis.h Source/GlassLook.h)
+    target_sources(NXMixPilot PRIVATE Source/Plugin.cpp Source/Analysis.h Source/GlassLook.h Source/GainMeter.h Source/InstrumentPresets.h)
     target_compile_definitions(NXMixPilot PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
     target_link_libraries(NXMixPilot PRIVATE

@@ -1,5 +1,6 @@
 #include "Analysis.h"
 #include "GlassLook.h"
+#include "InstrumentPresets.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
@@ -17,6 +18,37 @@ constexpr auto ink = 0xffe7edf5;
 constexpr auto cyan = 0xff24d3f5;
 constexpr auto muted = 0xffa0afc0;
 
+struct PublishedLevels
+{
+    void write(const nx::StereoLevels& value)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+        {
+            peak[channel] = value.peak[channel];
+            truePeak[channel] = value.truePeak[channel];
+            rms[channel] = value.rms[channel];
+            vu[channel] = value.vu[channel];
+            hold[channel] = value.hold[channel];
+        }
+    }
+
+    nx::StereoLevels read() const
+    {
+        nx::StereoLevels value;
+        for (int channel = 0; channel < 2; ++channel)
+        {
+            value.peak[channel] = peak[channel];
+            value.truePeak[channel] = truePeak[channel];
+            value.rms[channel] = rms[channel];
+            value.vu[channel] = vu[channel];
+            value.hold[channel] = hold[channel];
+        }
+        return value;
+    }
+
+    std::array<std::atomic<float>, 2> peak {}, truePeak {}, rms {}, vu {}, hold {};
+};
+
 struct Measurement
 {
     void write(const nx::Reading& reading, int group)
@@ -25,6 +57,11 @@ struct Measurement
         rms.store(reading.rms);
         peak.store(reading.peak);
         outputPeak.store(reading.outputPeak);
+        input.write(reading.inputLevels);
+        output.write(reading.outputLevels);
+        learningId.store(reading.learningId);
+        learnedPeak.store(reading.learnedPeak);
+        learnedCeiling.store(reading.learnedCeiling);
         sampleRate.store(reading.sampleRate);
         settled.store(reading.settled);
         position.store(reading.position);
@@ -43,6 +80,11 @@ struct Measurement
         reading.rms = rms.load();
         reading.peak = peak.load();
         reading.outputPeak = outputPeak.load();
+        reading.inputLevels = input.read();
+        reading.outputLevels = output.read();
+        reading.learningId = learningId.load();
+        reading.learnedPeak = learnedPeak.load();
+        reading.learnedCeiling = learnedCeiling.load();
         reading.sampleRate = sampleRate.load();
         reading.settled = settled.load();
         reading.position = position.load();
@@ -57,7 +99,9 @@ struct Measurement
         return true;
     }
 
-    std::atomic<unsigned> version {0};
+    PublishedLevels input, output;
+    std::atomic<unsigned> version {0}, learningId {0};
+    std::atomic<float> learnedPeak {nx::floorDb}, learnedCeiling {nx::floorDb};
     std::atomic<float> rms {nx::floorDb}, peak {nx::floorDb}, outputPeak {nx::floorDb};
     std::atomic<bool> settled {false};
     std::atomic<int> sampleRate {0}, session {0};
@@ -78,7 +122,7 @@ struct Registry
 {
     std::mutex mutex;
     std::array<Processor*, capacity> tracks {};
-    unsigned nextIdentity = 1;
+    unsigned nextIdentity = 1, nextLearningId = 1;
 };
 
 Registry& registry()
@@ -150,6 +194,19 @@ public:
                         "Tipo de acompanhamento", supportNames(), 0));
         result.add(std::make_unique<AudioParameterChoice>(ParameterID{"peakReference", 1},
                         utf8("Referência de pico"), peakNames(), 0));
+        result.add(std::make_unique<AudioParameterInt>(ParameterID{"instrument", 1},
+                        "Instrumento", 0, static_cast<int>(std::size(nx::presets)), 0));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"targetPeak", 1}, "Target de pico",
+                        NormalisableRange<float>{-36, 1, 0.1f}, 1));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"outputTrim", 1}, utf8("Ganho de saída"),
+                        NormalisableRange<float>{-24, 24, 0.01f}, 0));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"learnTime", 1}, "Janela de aprendizado (s)",
+                        NormalisableRange<float>{1.2f, 20, 0.1f}, 1.2f));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"sensitivity", 1}, "Sensibilidade",
+                        NormalisableRange<float>{0, 1, 0.01f}, 1));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"freeze", 1}, "Freeze", false));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"trueCeiling", 1}, "Limite true peak (dBTP)",
+                        NormalisableRange<float>{-18, 0, 0.1f}, -1));
         return result;
     }
 
@@ -169,7 +226,10 @@ public:
     void updateTrackProperties(const TrackProperties& properties) override
     {
         if (properties.name)
+        {
             hostTrackName = properties.name->trim();
+            inferredInstrument = inferInstrument();
+        }
     }
 
     juce::String displayName() const
@@ -186,6 +246,42 @@ public:
         parameter->beginChangeGesture();
         parameter->setValueNotifyingHost(parameter->convertTo0to1(rawValue));
         parameter->endChangeGesture();
+    }
+
+    int instrument() const
+    {
+        const int selection = static_cast<int>(value("instrument"));
+        return selection > 0 ? selection : inferredInstrument;
+    }
+
+    int inferInstrument() const
+    {
+        const auto name = hostTrackName.toLowerCase();
+        if (name.isEmpty())
+            return 0;
+        int best = 0, longest = 0;
+        for (std::size_t i = 0; i < std::size(nx::presets); ++i)
+        {
+            const auto candidate = utf8(nx::presets[i].name).toLowerCase();
+            if (candidate.length() > longest && name.contains(candidate))
+            {
+                best = static_cast<int>(i) + 1;
+                longest = candidate.length();
+            }
+        }
+        if (best != 0)
+            return best;
+        for (const auto& alias : {std::pair<const char*, const char*>{"bass", "Baixo elétrico"},
+                                 {"baixo", "Baixo elétrico"}, {"piano", "Piano acústico"},
+                                 {"keys", "Teclado de arranjo"}, {"guitar", "Guitarra clean"},
+                                 {"guitarra", "Guitarra clean"}, {"backing", "Backing uníssono"},
+                                 {"coral", "Coral misto"}, {"vocal", "Vocal principal masculino"},
+                                 {"voz", "Vocal principal masculino"}})
+            if (name.contains(alias.first))
+                for (std::size_t i = 0; i < std::size(nx::presets); ++i)
+                    if (utf8(nx::presets[i].name) == utf8(alias.second))
+                        return static_cast<int>(i) + 1;
+        return 0;
     }
 
     bool eligible(int sessionId) const { return !hub() && session() == sessionId && value("bypass") < 0.5f; }
@@ -227,18 +323,39 @@ public:
     {
         sampleRate = static_cast<int>(rate);
         analyzer.prepare(sampleRate);
+        inputMeter.prepare(rate);
+        outputMeter.prepare(rate);
         gain.reset(rate, 0.035);
+        outputGain.reset(rate, 0.035);
+        outputGain.setCurrentAndTargetValue(1);
         gain.setCurrentAndTargetValue(1);
         settings = -1;
     }
 
     void releaseResources() override { measurement.write({}, 0); }
 
-    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
+    bool supportsDoublePrecisionProcessing() const override { return true; }
+    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override { process(buffer); }
+    void processBlock(juce::AudioBuffer<double>& buffer, juce::MidiBuffer&) override { process(buffer); }
+
+    template <typename Sample>
+    void process(juce::AudioBuffer<Sample>& buffer)
     {
         juce::ScopedNoDenormals noDenormals;
         if (buffer.getNumChannels() == 0)
             return;
+        const auto request = learningRequest.load();
+        if (request != learningId)
+        {
+            learningId = request;
+            learningHistogram.fill(0);
+            learnedCeiling = learnedSampleMax = nx::floorDb;
+        }
+        if (holdReset.exchange(false))
+        {
+            inputMeter.resetHold();
+            outputMeter.resetHold();
+        }
         const auto sessionId = session();
         const auto isHub = hub();
         const int newSettings = sessionId * 2 + static_cast<int>(isHub);
@@ -252,7 +369,8 @@ public:
         const auto audition = previewSession.load() == sessionId ? preview.load() : noPreview;
         const bool bypass = value("bypass") >= 0.5f;
         const float trim = isHub || bypass ? 0.0f : audition == noPreview ? value("trim") : audition;
-        gain.setTargetValue(juce::Decibels::decibelsToGain(trim));
+        gain.setTargetValue(juce::Decibels::decibelsToGain(static_cast<double>(trim)));
+        outputGain.setTargetValue(juce::Decibels::decibelsToGain(static_cast<double>(value("outputTrim"))));
 
         std::int64_t hostPosition = -1;
         if (auto* playhead = getPlayHead())
@@ -265,20 +383,62 @@ public:
         nx::Reading reading;
         for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
         {
-            const float dryLeft = left[sample], dryRight = right ? right[sample] : dryLeft;
-            const float ramp = gain.getNextValue();
-            const float applied = bypass || isHub ? 1.0f : ramp;
-            left[sample] = dryLeft * applied;
+            const auto clean = [](Sample value) { return std::isfinite(value) ? value : Sample{}; };
+            const auto dryLeft = clean(left[sample]);
+            const auto dryRight = right ? clean(right[sample]) : dryLeft;
+            const auto ramp = gain.getNextValue() * outputGain.getNextValue();
+            const auto applied = bypass ? 1.0 : ramp;
+            const auto wetLeft = clean(static_cast<Sample>(dryLeft * applied));
+            const auto wetRight = clean(static_cast<Sample>(dryRight * applied));
+            left[sample] = wetLeft;
             if (right)
-                right[sample] = dryRight * applied;
+                right[sample] = wetRight;
+            const auto bounded = [](Sample value)
+            {
+                return static_cast<float>(std::clamp(static_cast<double>(value), -1000000.0, 1000000.0));
+            };
+            inputMeter.push(bounded(dryLeft), bounded(dryRight));
+            outputMeter.push(bounded(wetLeft), bounded(wetRight));
             const auto position = hostPosition < 0 ? -1 : hostPosition + sample;
-            if (analyzer.push(dryLeft, dryRight, left[sample], dryRight * applied, position, reading))
+            if (analyzer.push(bounded(dryLeft), bounded(dryRight), bounded(wetLeft), bounded(wetRight), position, reading))
+            {
+                reading.inputLevels = inputMeter.read();
+                reading.outputLevels = outputMeter.read();
+                if (learningId != 0)
+                {
+                    const float measured = nx::db(*std::max_element(reading.inputLevels.peak.begin(), reading.inputLevels.peak.end()));
+                    const float truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(), reading.inputLevels.truePeak.end()));
+                    if (measured > -60)
+                        ++learningHistogram[static_cast<std::size_t>(std::clamp(static_cast<int>(std::ceil(measured)) + 60, 0, 84))];
+                    learnedSampleMax = std::max(learnedSampleMax, measured);
+                    learnedCeiling = std::max(learnedCeiling, truePeak);
+                    reading.learningId = learningId;
+                    reading.learnedCeiling = learnedCeiling;
+                    unsigned total = 0;
+                    for (auto count : learningHistogram)
+                        total += count;
+                    const auto percentile = 0.85f + 0.15f * learningSensitivity.load();
+                    unsigned cumulative = 0;
+                    for (std::size_t bin = 0; total != 0 && bin < learningHistogram.size(); ++bin)
+                    {
+                        cumulative += learningHistogram[bin];
+                        if (cumulative >= std::ceil(total * percentile))
+                        {
+                            reading.learnedPeak = percentile >= 1.0f ? learnedSampleMax : static_cast<float>(bin) - 60.0f;
+                            break;
+                        }
+                    }
+                }
                 measurement.write(reading, sessionId);
+            }
         }
     }
 
     juce::AudioProcessorValueTreeState parameters;
     Measurement measurement;
+    std::atomic<unsigned> learningRequest {0};
+    std::atomic<float> learningSensitivity {1};
+    std::atomic<bool> holdReset {false};
     std::atomic<float> preview {noPreview};
     std::atomic<int> previewSession {0};
     unsigned identity = 0;
@@ -288,9 +448,14 @@ public:
     unsigned previewOwner = 0; // Accessed under the registry mutex.
 
 private:
+    int inferredInstrument = 0;
     juce::String hostTrackName; // VST3 channel-context callbacks and the editor use the message thread.
     nx::Analyzer analyzer;
-    juce::SmoothedValue<float> gain {1.0f};
+    nx::GainMeter inputMeter, outputMeter;
+    juce::SmoothedValue<double> gain {1.0}, outputGain {1.0};
+    std::array<unsigned, 85> learningHistogram {};
+    unsigned learningId = 0;
+    float learnedCeiling = nx::floorDb, learnedSampleMax = nx::floorDb;
     int sampleRate = 48000, settings = -1;
 };
 
@@ -307,6 +472,8 @@ struct TrackRow
     juce::String name;
     bool adjusted = false;
     int peakProfile = 0;
+    int instrument = 0;
+    float customPeak = 1.0f, outputGainDb = 0;
 };
 
 Processor* findTrack(unsigned identity)
@@ -322,11 +489,11 @@ juce::String number(float value)
     return juce::String(value, 1);
 }
 
-class Editor final : public juce::AudioProcessorEditor, private juce::Timer
+class Editor final : public juce::Component, private juce::Timer
 {
 public:
     explicit Editor(Processor& processor)
-        : AudioProcessorEditor(processor), plugin(processor)
+        : plugin(processor)
     {
         setLookAndFeel(&glass);
         using ComboAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
@@ -356,6 +523,28 @@ public:
         attachSlider(reference, "reference", " dBFS");
         attachSlider(limit, "limit", " dB");
         attachSlider(trackLimit, "limit", " dB");
+        attachSlider(outputTrim, "outputTrim", " dB");
+        attachSlider(targetPeak, "targetPeak", " dBFS");
+        attachSlider(learnTime, "learnTime", " s");
+        attachSlider(sensitivity, "sensitivity", "");
+        attachSlider(trueCeiling, "trueCeiling", " dBTP");
+        targetPeak.textFromValueFunction = [](double v)
+        {
+            return v > 0 ? juce::String("Preset") : juce::String(v, 1);
+        };
+        addAndMakeVisible(category);
+        category.addItem("Todas as categorias", 1);
+        for (std::size_t i = 0; i < std::size(nx::instrumentCategories); ++i)
+            category.addItem(utf8(nx::instrumentCategories[i]), static_cast<int>(i) + 2);
+        category.setSelectedId(1);
+        category.onChange = [this] { populateInstruments(); };
+        addAndMakeVisible(instruments);
+        instruments.onChange = [this]
+        {
+            if (instruments.getSelectedId() != 0)
+                plugin.setParameter("instrument", static_cast<float>(instruments.getSelectedId() - 1));
+        };
+        populateInstruments();
         attachSlider(headroom, "headroom", " dB");
         for (auto* knob : {&limit, &trim})
         {
@@ -402,6 +591,8 @@ public:
         configureButton(cancel, "Cancelar", [this]
         {
             const bool wasAnalyzing = analyzing;
+            if (wasAnalyzing)
+                assignLearning(0);
             analyzing = false;
             discard(wasAnalyzing ? utf8("Análise cancelada.") : utf8("Prévia cancelada."));
             updateButtons();
@@ -410,6 +601,8 @@ public:
         {
             if (analysisOnly.getToggleState())
             {
+                if (analyzing)
+                    assignLearning(0);
                 analyzing = false;
                 discard(utf8("Somente análise ativa. O áudio mantém os trims aplicados."));
             }
@@ -420,12 +613,23 @@ public:
         });
         analysisOnly.setClickingTogglesState(true);
         analysisOnly.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff126476));
+        configureButton(manualAnalyze, "ANALYZE", [this] { capture(); });
+        configureButton(autoGain, "AUTO GAIN", [this] { startAnalysis(); });
+        configureButton(resetHold, "RESET", [this]
+        {
+            plugin.holdReset.store(true);
+            status = utf8("Peak hold reiniciado nesta instância.");
+        });
+        freeze.setButtonText("FREEZE");
+        addAndMakeVisible(freeze);
+        freezeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+            plugin.parameters, "freeze", freeze);
         bypass.setButtonText("Bypass");
         addAndMakeVisible(bypass);
         bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
             plugin.parameters, "bypass", bypass);
 
-        setSize(1050, 710);
+        setSize(1050, 966);
         timerCallback();
         startTimerHz(12);
     }
@@ -433,6 +637,8 @@ public:
     ~Editor() override
     {
         stopTimer();
+        if (analyzing)
+            assignLearning(0);
         setLookAndFeel(nullptr);
         std::lock_guard<std::mutex> lock(registry().mutex);
         clearPreview();
@@ -456,6 +662,17 @@ public:
         trim.setBounds(807, 494, 128, 130);
         limit.setBounds(trim.getBounds());
 
+        category.setBounds(17, 745, 190, 27);
+        instruments.setBounds(214, 745, 220, 27);
+        targetPeak.setBounds(447, 745, 122, 27);
+        outputTrim.setBounds(581, 745, 123, 27);
+        learnTime.setBounds(719, 745, 139, 27);
+        sensitivity.setBounds(869, 745, 154, 27);
+        trueCeiling.setBounds(116, 803, 134, 26);
+        manualAnalyze.setBounds(273, 802, 112, 28);
+        autoGain.setBounds(396, 802, 119, 28);
+        freeze.setBounds(529, 802, 90, 28);
+        resetHold.setBounds(629, 802, 96, 28);
         analyze.setBounds(16, 652, 127, 34);
         review.setBounds(153, 652, 146, 34);
         audition.setBounds(309, 652, 116, 34);
@@ -572,6 +789,21 @@ public:
         }
 
         panel(g, 5, 644, 1040, 63);
+        panel(g, 5, 714, 1040, 134);
+        drawStereoDetails(g);
+        label(g, utf8("Categoria"), 17, 724, 190, 18, 12);
+        label(g, utf8("Instrumento"), 214, 724, 220, 18, 12);
+        label(g, "Target de pico", 447, 724, 122, 18, 12);
+        label(g, utf8("Ganho de saída"), 581, 724, 123, 18, 12);
+        label(g, "Janela", 719, 724, 139, 18, 12);
+        label(g, "Sensibilidade", 869, 724, 154, 18, 12);
+        label(g, "Limite True Peak", 17, 803, 101, 26, 12);
+        const int preset = plugin.instrument();
+        if (preset > 0)
+            label(g, utf8(nx::presets[preset - 1].name) + "  /  "
+                + number(plugin.value("targetPeak") <= 0 ? plugin.value("targetPeak") : nx::presets[preset - 1].target)
+                + " dBFS pico", 17, 775, 670, 19, 12, cyan);
+
         label(g, status, 17, 685, 1016, 18, 13, analyzing ? 0xff63f69e : ink);
     }
 
@@ -641,6 +873,43 @@ private:
             g.setColour(level >= threshold ? color : juce::Colour(0xff243241));
             g.fillRoundedRectangle(segment, 1.0f);
         }
+    }
+
+    void drawStereoDetails(juce::Graphics& g) const
+    {
+        panel(g, 5, 852, 1040, 108);
+        label(g, utf8("MEDIDORES ESTÉREO"), 17, 859, 185, 20, 13, ink, true);
+        label(g, utf8("Trim de entrada: ") + number(plugin.hub() ? 0.0f : plugin.value("trim")) + " dB",
+              807, 859, 205, 20, 12);
+        const auto reading = [&](float value, float reference = 0.0f)
+        {
+            return localCurrent && value > 0.000001f ? number(nx::db(value) - reference) : utf8("—");
+        };
+        const std::array<int, 5> columns {211, 323, 435, 547, 659};
+        const std::array<juce::String, 5> captions {"Peak dBFS", "True peak dBTP", "RMS dBFS", "VU", "Hold dBTP"};
+        for (std::size_t i = 0; i < columns.size(); ++i)
+            label(g, captions[i], columns[i], 860, 108, 18, 12);
+        auto render = [&](const nx::StereoLevels& meter, int channel, int y, const char* name)
+        {
+            label(g, utf8(name), 17, y, 95, 16, 12);
+            drawSegments(g, {115.0f, static_cast<float>(y + 5), 80, 7},
+                         localCurrent ? nx::db(meter.peak[channel]) : nx::floorDb, 12, false);
+            const std::array<juce::String, 5> values {
+                reading(meter.peak[channel]), reading(meter.truePeak[channel]), reading(meter.rms[channel]),
+                reading(meter.vu[channel], plugin.value("reference")), reading(meter.hold[channel])
+            };
+            for (std::size_t i = 0; i < columns.size(); ++i)
+                label(g, values[i], columns[i], y, 100, 16, 12, ink);
+        };
+        render(local.inputLevels, 0, 880, "Entrada L");
+        render(local.inputLevels, 1, 898, "Entrada R");
+        render(local.outputLevels, 0, 916, "Saída L");
+        render(local.outputLevels, 1, 934, "Saída R");
+        const auto peak = *std::max_element(local.outputLevels.hold.begin(), local.outputLevels.hold.end());
+        if (localCurrent && peak >= 1.0f)
+            badge(g, "CLIP", 808, 895, 58, 0xffff725d);
+        else if (localCurrent && nx::db(peak) > plugin.value("trueCeiling"))
+            badge(g, "ACIMA DO LIMITE", 808, 895, 142, amber);
     }
 
     void drawMeters(juce::Graphics& g) const
@@ -870,6 +1139,8 @@ private:
 
         const bool isHub = plugin.hub();
         operation.setVisible(isHub);
+        if (instruments.getSelectedId() != static_cast<int>(plugin.value("instrument")) + 1)
+            populateInstruments();
         scope.setVisible(isHub);
         limit.setVisible(isHub);
         reference.setVisible(mode() == nx::GainMode::calibration);
@@ -893,7 +1164,10 @@ private:
             TrackRow row {track.identity, track.group(), track.musicalRole(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
-            row.peakProfile = static_cast<int>(track.value("peakReference"));
+            row.peakProfile = track.value("instrument") > 0 ? 0 : static_cast<int>(track.value("peakReference"));
+            row.instrument = track.instrument();
+            row.customPeak = track.value("targetPeak");
+            row.outputGainDb = track.value("outputTrim");
             row.adjusted = track.lastAppliedTrim && std::abs(*track.lastAppliedTrim - row.trim) <= 0.011f;
             rows.push_back(row);
         };
@@ -919,6 +1193,39 @@ private:
         finishAnalysis();
         updateButtons();
         repaint();
+    }
+
+    void populateInstruments()
+    {
+        instruments.clear(juce::dontSendNotification);
+        instruments.addItem(utf8("Automático pelo nome da pista"), 1);
+        const int chosen = category.getSelectedId() - 2;
+        const int selected = static_cast<int>(plugin.value("instrument"));
+        for (std::size_t i = 0; i < std::size(nx::presets); ++i)
+            if (chosen < 0 || nx::presets[i].category == chosen || static_cast<int>(i) + 1 == selected)
+                instruments.addItem(utf8(nx::presets[i].name), static_cast<int>(i) + 2);
+        instruments.setSelectedId(selected + 1, juce::dontSendNotification);
+    }
+
+    void assignLearning(unsigned id)
+    {
+        if (id != 0 && !plugin.hub())
+        {
+            plugin.learningSensitivity.store(plugin.value("sensitivity"));
+            plugin.learningRequest.store(id);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        for (auto* track : registry().tracks)
+            if (track && id == 0 && track->learningRequest.load() == activeLearning)
+                track->learningRequest.store(0);
+            else if (track && id != 0 && !track->hub() && track->session() == plugin.session())
+            {
+                track->learningSensitivity.store(plugin.value("sensitivity"));
+                track->learningRequest.store(id);
+            }
+        if (id == 0 && plugin.learningRequest.load() == activeLearning)
+            plugin.learningRequest.store(0);
     }
 
     void updatePrincipalButtons()
@@ -959,6 +1266,8 @@ private:
             selected->setParameter("role", nx::focus);
             plugin.setParameter("operation", 1);
         }
+        if (analyzing)
+            assignLearning(0);
         analyzing = false;
         discard(rows[index].name + utf8(" é a Principal. Reproduza o trecho e clique em ANALYZER."));
         timerCallback();
@@ -968,7 +1277,9 @@ private:
     {
         analyze.setToggleState(analyzing, juce::dontSendNotification);
         const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
-        analyze.setEnabled(writable);
+        analyze.setEnabled(writable && !freeze.getToggleState());
+        autoGain.setEnabled(writable && !freeze.getToggleState());
+        manualAnalyze.setEnabled(!analyzing);
         review.setEnabled(!analyzing);
         apply.setEnabled(writable && !analyzing && !pending.empty());
         audition.setEnabled(writable && !analyzing && !pending.empty());
@@ -976,41 +1287,54 @@ private:
         undo.setEnabled(writable && !analyzing && !plugin.history.empty());
     }
 
-    std::array<float, 6> analysisSettings() const
+    std::array<float, 9> analysisSettings() const
     {
         return {plugin.value("instance"), plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
-                plugin.value("limit"), plugin.value("headroom")};
+                plugin.value("limit"), plugin.value("headroom"), plugin.value("learnTime"),
+                plugin.value("sensitivity"), plugin.value("trueCeiling")};
     }
 
     void startAnalysis()
     {
-        if (analysisOnly.getToggleState() || analyzing || plugin.value("bypass") > 0.5f)
+        if (freeze.getToggleState() || analysisOnly.getToggleState() || analyzing || plugin.value("bypass") > 0.5f)
             return;
         discard(plugin.hub()
             ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
             : utf8("ANALYZER  /  Mantenha a pista em reprodução. O trim local será ajustado."));
         requestedSettings = analysisSettings();
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            activeLearning = registry().nextLearningId++;
+        }
+        assignLearning(activeLearning);
         analysisStarted = juce::Time::getMillisecondCounter();
         analyzing = true;
         updateButtons();
         repaint();
     }
 
+    juce::uint32 learningDuration() const
+    {
+        return static_cast<juce::uint32>(std::lround(plugin.value("learnTime") * 1000.0f));
+    }
+
     void finishAnalysis()
     {
         if (!analyzing)
             return;
-        if (plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
+        if (freeze.getToggleState() || plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
         {
             analyzing = false;
+            assignLearning(0);
             status = utf8("ANALYZER cancelado após alteração das configurações.");
             return;
         }
-        if (juce::Time::getMillisecondCounter() - analysisStarted < 1200)
+        if (juce::Time::getMillisecondCounter() - analysisStarted < learningDuration())
             return;
 
         analyzing = false;
         prepareChanges(true);
+        assignLearning(0);
         if (!pending.empty())
             commit();
     }
@@ -1080,8 +1404,24 @@ private:
         const auto anchor = mode() == nx::GainMode::calibration ? plugin.value("reference") : focusAnchor;
         for (auto& row : rows)
             if (canSuggest(row))
-                row.proposed = nx::suggestTrim(row.reading, mode(), anchor, row.role,
-                                               plugin.value("limit"), plugin.value("headroom"), row.peakProfile);
+                row.proposed = suggest(row, anchor, false);
+
+    }
+
+    nx::GainSuggestion suggest(const TrackRow& row, float anchor, bool learned) const
+    {
+        auto reading = row.reading;
+        if (learned && reading.learnedPeak > nx::floorDb)
+            reading.peak = reading.learnedPeak;
+        const float liveTrue = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
+                                                       reading.inputLevels.truePeak.end()));
+        const float maximum = std::max(liveTrue, learned ? reading.learnedCeiling : liveTrue);
+        const float headroomDb = std::max(plugin.value("headroom"), -plugin.value("trueCeiling") + row.outputGainDb);
+        float target = row.customPeak;
+        if (target > 0 && row.peakProfile == 0 && row.instrument > 0)
+            target = nx::presets[row.instrument - 1].target;
+        return nx::suggestTrim(reading, mode(), anchor, row.role, plugin.value("limit"),
+                               headroomDb, row.peakProfile, target, maximum);
     }
 
     void capture()
@@ -1101,16 +1441,23 @@ private:
         const auto fresh = [&](const TrackRow& row)
         {
             const auto elapsed = row.timestamp - analysisStarted;
-            return row.current && (!automatic || (elapsed >= 1000
+            return row.current && (!automatic || (elapsed >= learningDuration() - 200
                 && elapsed <= juce::Time::getMillisecondCounter() - analysisStarted));
         };
-        const auto usable = [&](const TrackRow& row) { return fresh(row) && canSuggest(row); };
+        const auto usable = [&](const TrackRow& row)
+        {
+            return fresh(row) && canSuggest(row) && (!automatic
+                || (row.reading.learningId == activeLearning
+                    && !(row.instrument > 0 && nx::presets[row.instrument - 1].category == 7)));
+        };
         if (mode() == nx::GainMode::musical
             && (focusRow < 0 || !fresh(rows[static_cast<std::size_t>(focusRow)])))
         {
             status = "Escolha uma pista de Foco e reproduza um trecho ativo.";
             return;
         }
+        const auto anchor = mode() == nx::GainMode::calibration ? plugin.value("reference")
+            : rows[static_cast<std::size_t>(focusRow)].reading.rms + rows[static_cast<std::size_t>(focusRow)].trim;
         int skipped = 0;
         capturedSession = plugin.session();
         capturedHub = plugin.hub();
@@ -1139,12 +1486,13 @@ private:
         {
             if (!inScope(row))
                 continue;
-            if (!usable(row) || (!commonCalibration && row.proposed.headroomUnmet))
+            const auto proposedGain = usable(row) ? suggest(row, anchor, automatic) : nx::GainSuggestion{};
+            if (!usable(row) || (!commonCalibration && proposedGain.headroomUnmet))
             {
                 ++skipped;
                 continue;
             }
-            const float proposed = commonCalibration ? row.trim + commonStep : row.proposed.trim;
+            const float proposed = commonCalibration ? row.trim + commonStep : proposedGain.trim;
             const float safe = -capturedHeadroom - row.reading.peak;
             const float rounded = std::round(proposed * 100.0f) / 100.0f;
             const float next = rounded <= safe ? rounded : std::floor(safe * 100.0f) / 100.0f;
@@ -1178,8 +1526,12 @@ private:
             || (track->previewOwner != 0 && track->previewOwner != plugin.identity))
             return false;
         nx::Reading reading;
-        return track->measurement.read(reading, capturedSession) && reading.active()
-            && change.next + reading.peak <= -capturedHeadroom + 0.001f;
+        if (!track->measurement.read(reading, capturedSession) || !reading.active())
+            return false;
+        const auto truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
+                                                       reading.inputLevels.truePeak.end()));
+        return change.next + reading.peak <= -capturedHeadroom + 0.001f
+            && change.next + track->value("outputTrim") + truePeak <= plugin.value("trueCeiling") + 0.001f;
     }
 
     void clearPreview()
@@ -1292,20 +1644,23 @@ private:
     int firstRow = 0;
     Processor& plugin;
     GlassLook glass;
-    juce::ComboBox instance, role, operation, scope, pick, support, peakReference;
+    juce::ComboBox instance, role, operation, scope, pick, support, peakReference, category, instruments;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
-    juce::ToggleButton bypass;
+    juce::ToggleButton bypass, freeze;
+    juce::TextButton manualAnalyze, autoGain, resetHold;
+    juce::Slider outputTrim, targetPeak, learnTime, sensitivity, trueCeiling;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment, freezeAttachment;
     std::vector<TrackRow> rows;
     std::vector<Change> pending;
     nx::Reading local;
     bool localCurrent = false, listening = false, analyzing = false;
-    std::array<float, 6> requestedSettings {};
+    std::array<float, 9> requestedSettings {};
     juce::uint32 analysisStarted = 0;
+    unsigned activeLearning = 0;
     int focusRow = -1, otherRow = -1, capturedSession = 0;
     float capturedHeadroom = 0;
     bool capturedHub = false;
@@ -1313,7 +1668,30 @@ private:
     juce::String tonalStatus;
 };
 
-juce::AudioProcessorEditor* Processor::createEditor() { return new Editor(*this); }
+class ResizableEditor final : public juce::AudioProcessorEditor
+{
+public:
+    explicit ResizableEditor(Processor& processor)
+        : AudioProcessorEditor(processor), content(processor)
+    {
+        addAndMakeVisible(content);
+        setResizable(true, true);
+        setResizeLimits(788, 725, 3150, 2898);
+        getConstrainer()->setFixedAspectRatio(1050.0 / 966.0);
+        setSize(1050, 966);
+    }
+
+    void resized() override
+    {
+        const auto scale = std::min(getWidth() / 1050.0f, getHeight() / 966.0f);
+        content.setTransform(juce::AffineTransform::scale(scale));
+    }
+
+private:
+    Editor content;
+};
+
+juce::AudioProcessorEditor* Processor::createEditor() { return new ResizableEditor(*this); }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new Processor; }

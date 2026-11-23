@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GainMeter.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -30,6 +32,9 @@ struct Reading
     float rms = floorDb;
     float peak = floorDb;
     float outputPeak = floorDb;
+    StereoLevels inputLevels {}, outputLevels {};
+    float learnedPeak = floorDb, learnedCeiling = floorDb;
+    unsigned learningId = 0;
     int sampleRate = 0;
     bool settled = false;
     std::int64_t position = -1;
@@ -191,7 +196,8 @@ inline constexpr std::array<PeakRange, 10> instrumentPeakRanges {{
 }};
 
 inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float reference,
-                                  Role role, float maxTrim, float headroom, int peakProfile = 0)
+                                  Role role, float maxTrim, float headroom, int peakProfile = 0, float customPeak = 1.0f,
+                                  float ceiling = floorDb)
 {
     if (!reading.active())
         return {};
@@ -220,7 +226,10 @@ inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float r
             ? range.target - reading.peak
             : std::clamp(wanted, range.minimum - reading.peak, range.maximum - reading.peak);
     }
-    const float safe = -headroom - reading.peak;
+    if (customPeak <= 0 && !(mode == GainMode::musical && role == focus))
+        wanted = mode == GainMode::calibration ? customPeak - reading.peak
+            : std::min(wanted, customPeak - reading.peak);
+    const float safe = -headroom - std::max(reading.peak, ceiling);
     const float trim = std::clamp(std::min(wanted, safe), -maxTrim, maxTrim);
     return {trim, wanted > safe, trim > safe + 0.001f};
 }

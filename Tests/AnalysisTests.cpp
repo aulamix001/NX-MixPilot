@@ -106,5 +106,29 @@ int main()
     auto shifted = measured;
     shifted.position += nx::fftSize;
     expect(nx::findOverlap(measured, shifted).band == -1, "Unaligned measurements must not report overlap.");
+    nx::GainMeter meter;
+    meter.prepare(48000);
+    const auto amplitude = std::sqrt(2.0) * std::pow(10.0, -18.0 / 20.0);
+    for (int i = 0; i < 72000; ++i)
+    {
+        const auto sine = amplitude * std::sin(2 * 3.141592653589793 * 1000 * i / 48000);
+        meter.push(sine, sine * 0.5);
+    }
+    const auto calibration = meter.read();
+    expect(near(nx::db(calibration.rms[0]), -18, 0.05f), "Calibrated sine RMS must be -18 dBFS.");
+    expect(near(nx::db(calibration.vu[0]) + 18, 0, 0.08f), "Calibrated sine VU must read 0.");
+    expect(near(nx::db(calibration.peak[0]) - nx::db(calibration.peak[1]), 6.0206f, 0.07f),
+           "Stereo meter must preserve independent channel levels.");
+    expect(near(nx::db(calibration.peak[0]), -14.99f, 0.07f), "Sine sample peak must be about -15 dBFS.");
+    meter.resetHold();
+    expect(meter.read().hold[0] == 0, "Peak hold must clear on reset.");
+    meter.prepare(48000);
+    for (int i = 0; i < 2048; ++i)
+        meter.push(0.9 * std::sin((i + 0.5) * 3.141592653589793 * 0.5), 0);
+    const auto intersample = meter.read();
+    expect(near(intersample.peak[0], 0.9f / std::sqrt(2.0f), 0.01f), "Inter-sample test has known sample peak.");
+    expect(intersample.truePeak[0] >= 0.88f && intersample.truePeak[0] <= 0.93f,
+           "4x true peak must recover the inter-sample maximum of a quarter-rate sine.");
+    expect(intersample.peak[1] == 0 && intersample.truePeak[1] == 0, "Silent right channel must remain silent.");
     std::cout << "RMS, sample peak, nominal and custom calibration, group gain, musical roles and spectral alignment passed.\n";
 }
