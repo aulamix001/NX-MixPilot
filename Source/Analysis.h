@@ -182,11 +182,12 @@ struct PeakRange
 {
     float minimum;
     float maximum;
+    float target;
 };
 
 inline constexpr std::array<PeakRange, 10> instrumentPeakRanges {{
-    {-12, -6}, {-12, -6}, {-20, -12}, {-12, -6}, {-18, -10},
-    {-18, -10}, {-24, -12}, {-18, -8}, {-12, -6}, {-18, -10}
+    {-12, -6, -10}, {-12, -6, -10}, {-20, -12, -16}, {-12, -6, -10}, {-18, -10, -14},
+    {-18, -10, -14}, {-24, -12, -18}, {-18, -8, -13}, {-12, -6, -10}, {-18, -10, -14}
 }};
 
 inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float reference,
@@ -215,7 +216,9 @@ inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float r
         && !(mode == GainMode::musical && role == focus))
     {
         const auto range = instrumentPeakRanges[static_cast<std::size_t>(peakProfile - 1)];
-        wanted = std::clamp(wanted, range.minimum - reading.peak, range.maximum - reading.peak);
+        wanted = mode == GainMode::calibration
+            ? range.target - reading.peak
+            : std::clamp(wanted, range.minimum - reading.peak, range.maximum - reading.peak);
     }
     const float safe = -headroom - reading.peak;
     const float trim = std::clamp(std::min(wanted, safe), -maxTrim, maxTrim);

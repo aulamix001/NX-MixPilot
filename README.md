@@ -44,7 +44,7 @@ No balanço musical, a pista de **Foco** continua sendo a âncora. A análise to
 
 ## Referências de pico por instrumento
 
-No editor **Track**, selecione o instrumento em **Referência de pico por instrumento**. A faixa aparece em dBFS de pico de amostra. O **ANALYZER** usa essa faixa para orientar o trim individual. Os limites de trim e headroom têm prioridade. Em Balanço musical, a pista de foco preserva sua função de âncora. A calibração em grupo com ganho comum prioriza preservar os níveis relativos. No HUB, o indicador de −6 dBFS é uma referência visual para o bus pré-master.
+No editor **Track**, selecione o instrumento em **Referência de pico por instrumento**. O alvo e a faixa aparecem em dBFS de pico de amostra. Na calibração técnica por instrumento, o **ANALYZER** calcula o trim individual pela diferença entre o alvo e o pico medido antes do trim. Sem instrumento selecionado, usa a referência RMS ajustável. No Balanço musical, a faixa orienta a sugestão das pistas secundárias. Os limites de trim e headroom têm prioridade. Em Balanço musical, a pista de foco preserva sua função de âncora. A calibração em grupo com ganho comum prioriza preservar os níveis relativos. No HUB, o indicador de −6 dBFS é uma referência visual para o bus pré-master.
 
 ## Hierarquia de mix
 

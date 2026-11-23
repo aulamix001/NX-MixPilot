@@ -562,7 +562,7 @@ public:
             if (profile > 0)
             {
                 const auto range = nx::instrumentPeakRanges[static_cast<std::size_t>(profile - 1)];
-                label(g, number(range.minimum) + " a " + number(range.maximum) + " dBFS (pico)",
+                label(g, "Alvo: " + number(range.target) + " dBFS pico  /  Faixa: " + number(range.minimum) + " a " + number(range.maximum),
                       325, 605, 348, 19, 12, cyan);
             }
             label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);

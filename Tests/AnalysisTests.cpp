@@ -61,12 +61,18 @@ int main()
         "Musical roles must not affect the technical calibration reference.");
     auto peakCheck = quiet;
     peakCheck.peak = -21;
-    expect(near(nx::suggestTrim(peakCheck, nx::GainMode::calibration, -18, nx::music, 20, 3, 1).trim, 9),
+    expect(near(nx::suggestTrim(peakCheck, nx::GainMode::calibration, -18, nx::music, 20, 3, 1).trim, 11),
            "Kick preset must bring expected sample peak into the supplied range.");
     expect(near(nx::suggestTrim(peakCheck, nx::GainMode::musical, -24, nx::focus, 20, 3, 9).trim, 0),
            "A main vocal selected as Principal must retain its musical anchor.");
     expect(near(nx::suggestTrim(peakCheck, nx::GainMode::calibration, -18, nx::music, 5, 3, 1).trim, 5),
            "The suggested peak range must not override the trim limit.");
+    peakCheck.peak = -8;
+    expect(near(nx::suggestTrim(peakCheck, nx::GainMode::calibration, -18, nx::music, 12, 3, 5).trim, -6),
+           "A piano peaking at -8 must get -6 dB trim to reach -14 dBFS.");
+    peakCheck.peak = -16;
+    expect(near(nx::suggestTrim(peakCheck, nx::GainMode::calibration, -18, nx::bass, 12, 3, 4).trim, 6),
+           "A bass peaking at -16 must get +6 dB trim to reach -10 dBFS.");
     expect(nx::bassHeavy(tone(94, -24)) && !nx::bassHeavy(measured), "Auto role must distinguish dominant lows.");
 
     auto transient = quiet;
