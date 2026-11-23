@@ -630,6 +630,15 @@ private:
         metric("Headroom", signal ? number(-local.outputPeak) + " dB" : dash, 310);
     }
 
+    static juce::Colour spectrumColour(const TrackRow& row)
+    {
+        if (row.role == nx::focus)
+            return juce::Colour(cyan);
+        // Space consecutive track identities apart and reserve cyan for the principal.
+        const float hue = std::fmod(static_cast<float>(row.identity) * 0.618034f, 1.0f);
+        return juce::Colour::fromHSV(hue < 0.43f ? hue : hue * 0.86f + 0.14f, 0.61f, 0.98f, 1.0f);
+    }
+
     void drawSpectrum(juce::Graphics& g) const
     {
         const juce::Rectangle<float> plot(62, 194, 612, 163);
@@ -655,7 +664,7 @@ private:
             return std::any_of(reading.power.begin(), reading.power.end(),
                                [](float power) { return power > 1.0e-8f; });
         };
-        const auto trace = [&](const nx::Reading& reading, juce::uint32 tint)
+        const auto trace = [&](const nx::Reading& reading, juce::Colour color, bool secondary)
         {
             std::array<float, nx::bands> y {}, slope {};
             const float pitch = plot.getWidth() / nx::bands;
@@ -685,39 +694,43 @@ private:
                               x + 2.0f * pitch / 3.0f, y[i + 1] - slope[i + 1] / 3.0f,
                               x + pitch, y[i + 1]);
             }
-            const juce::Colour color(tint);
             auto fill = curve;
             fill.lineTo(lastX, plot.getBottom());
             fill.lineTo(firstX, plot.getBottom());
             fill.closeSubPath();
-            g.setGradientFill({color.withAlpha(0.43f), plot.getX(), plot.getY() + 40.0f,
-                               color.withAlpha(0.035f), plot.getX(), plot.getBottom(), false});
+            g.setGradientFill({color.withAlpha(secondary ? 0.08f : 0.33f), plot.getX(), plot.getY() + 40.0f,
+                               color.withAlpha(secondary ? 0.006f : 0.025f), plot.getX(), plot.getBottom(), false});
             g.fillPath(fill);
-            g.setColour(color.withAlpha(0.16f));
-            g.strokePath(curve, juce::PathStrokeType(5));
-            g.setColour(color);
-            g.strokePath(curve, juce::PathStrokeType(1.65f));
+            if (!secondary)
+            {
+                g.setColour(color.withAlpha(0.16f));
+                g.strokePath(curve, juce::PathStrokeType(5));
+            }
+            g.setColour(color.withAlpha(secondary ? 0.64f : 1.0f));
+            g.strokePath(curve, juce::PathStrokeType(secondary ? 1.1f : 1.65f));
         };
         bool drewTrace = false;
-        if (otherRow >= 0 && hasSpectrum(rows[static_cast<std::size_t>(otherRow)].reading))
+        const auto* principal = focusRow >= 0 ? &rows[static_cast<std::size_t>(focusRow)] : nullptr;
+        if (plugin.hub())
+            for (const auto& row : rows)
+                if (&row != principal && row.current && hasSpectrum(row.reading))
+                {
+                    trace(row.reading, spectrumColour(row), true);
+                    drewTrace = true;
+                }
+
+        if (localCurrent && hasSpectrum(local))
         {
-            const auto& other = rows[static_cast<std::size_t>(otherRow)];
-            trace(other.reading, amber);
+            const auto mixColor = juce::Colour(plugin.hub() ? 0xffa9bed3 : cyan);
+            trace(local, mixColor, drewTrace);
             drewTrace = true;
-            label(g, other.name, 566, 161, 108, 24, 12, amber);
+            label(g, plugin.hub() ? "Mix bus" : "Entrada", 581, 161, 90, 24, 12, mixColor.getARGB());
         }
-        if (focusRow >= 0 && hasSpectrum(rows[static_cast<std::size_t>(focusRow)].reading))
+        if (principal != nullptr && hasSpectrum(principal->reading))
         {
-            const auto& focus = rows[static_cast<std::size_t>(focusRow)];
-            trace(focus.reading, cyan);
+            trace(principal->reading, spectrumColour(*principal), false);
             drewTrace = true;
-            label(g, focus.name + " (Foco)", 421, 161, 135, 24, 12, cyan);
-        }
-        else if (localCurrent && hasSpectrum(local))
-        {
-            trace(local, cyan);
-            drewTrace = true;
-            label(g, plugin.hub() ? "Mix bus" : "Entrada", 565, 161, 105, 24, 12, cyan);
+            label(g, principal->name + " (Principal)", 385, 161, 181, 24, 12, cyan);
         }
         if (!drewTrace)
             label(g, "Aguardando sinal", 309, 257, 168, 20, 14, ink);
@@ -755,7 +768,12 @@ private:
                 g.drawRoundedRectangle(strip, 5, 1);
             }
             const int top = static_cast<int>(y);
-            label(g, row.name + " / G" + juce::String(row.group), 31, top, 99, 28, 13, ink);
+            if (plugin.hub())
+            {
+                g.setColour(spectrumColour(row));
+                g.fillEllipse(26.0f, y + 11.0f, 6.0f, 6.0f);
+            }
+            label(g, row.name + " / G" + juce::String(row.group), 36, top, 81, 28, 13, ink);
             if (!plugin.hub() && row.role == nx::focus)
                 badge(g, "Foco", 124, top + 3, 43, cyan);
             const bool signal = row.current && row.reading.peak > -90;
