@@ -140,6 +140,17 @@ public:
     bool hub() const { return value("instance") > 0.5f; }
     nx::Role role() const { return static_cast<nx::Role>(static_cast<int>(value("role"))); }
     int group() const { return static_cast<int>(value("group")); }
+    void updateTrackProperties(const TrackProperties& properties) override
+    {
+        if (properties.name)
+            hostTrackName = properties.name->trim();
+    }
+
+    juce::String displayName() const
+    {
+        return hostTrackName.isNotEmpty() ? hostTrackName : "Pista " + juce::String(identity);
+    }
+
 
     void setTrim(float dB) { setParameter("trim", dB); }
 
@@ -250,6 +261,7 @@ public:
     unsigned previewOwner = 0; // Accessed under the registry mutex.
 
 private:
+    juce::String hostTrackName; // VST3 channel-context callbacks and the editor use the message thread.
     nx::Analyzer analyzer;
     juce::SmoothedValue<float> gain {1.0f};
     int sampleRate = 48000, settings = -1;
@@ -265,6 +277,7 @@ struct TrackRow
     nx::Reading reading;
     nx::GainSuggestion proposed;
     juce::uint32 timestamp = 0;
+    juce::String name;
 };
 
 Processor* findTrack(unsigned identity)
@@ -278,11 +291,6 @@ Processor* findTrack(unsigned identity)
 juce::String number(float value)
 {
     return juce::String(value, 1);
-}
-
-juce::String trackName(unsigned identity)
-{
-    return "Pista " + juce::String(identity);
 }
 
 class Editor final : public juce::AudioProcessorEditor, private juce::Timer
@@ -461,7 +469,7 @@ public:
         badge(g, hubMode ? "HUB" : "TRACK", 307, 19, 66, cyan);
         const auto active = std::count_if(rows.begin(), rows.end(), [](const auto& row) { return row.current && row.reading.active(); });
         const auto subtitle = hubMode ? juce::String(active) + "/" + juce::String(rows.size()) + " pistas com sinal"
-                                      : trackName(plugin.identity);
+                                      : plugin.displayName();
         label(g, subtitle, 405, 17, 255, 30, 14, ink);
         label(g, utf8("Instância"), 782, 18, 66, 28);
 
@@ -696,14 +704,14 @@ private:
             const auto& other = rows[static_cast<std::size_t>(otherRow)];
             trace(other.reading, amber);
             drewTrace = true;
-            label(g, trackName(other.identity), 566, 161, 108, 24, 12, amber);
+            label(g, other.name, 566, 161, 108, 24, 12, amber);
         }
         if (focusRow >= 0 && hasSpectrum(rows[static_cast<std::size_t>(focusRow)].reading))
         {
             const auto& focus = rows[static_cast<std::size_t>(focusRow)];
             trace(focus.reading, cyan);
             drewTrace = true;
-            label(g, trackName(focus.identity) + " (Foco)", 421, 161, 135, 24, 12, cyan);
+            label(g, focus.name + " (Foco)", 421, 161, 135, 24, 12, cyan);
         }
         else if (localCurrent && hasSpectrum(local))
         {
@@ -747,7 +755,7 @@ private:
                 g.drawRoundedRectangle(strip, 5, 1);
             }
             const int top = static_cast<int>(y);
-            label(g, trackName(row.identity) + " / G" + juce::String(row.group), 31, top, 99, 28, 13, ink);
+            label(g, row.name + " / G" + juce::String(row.group), 31, top, 99, 28, 13, ink);
             if (!plugin.hub() && row.role == nx::focus)
                 badge(g, "Foco", 124, top + 3, 43, cyan);
             const bool signal = row.current && row.reading.peak > -90;
@@ -805,7 +813,7 @@ private:
         focusRow = otherRow = -1;
         auto append = [&](Processor& track)
         {
-            TrackRow row {track.identity, track.group(), track.role(), track.value("trim"), false, {}, {}};
+            TrackRow row {track.identity, track.group(), track.role(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
             rows.push_back(row);
@@ -845,7 +853,7 @@ private:
             if (present)
             {
                 const auto& row = rows[index];
-                button.setTitle("Marcar " + trackName(row.identity) + " como Principal");
+                button.setTitle("Marcar " + row.name + " como Principal");
                 button.setToggleState(row.role == nx::focus, juce::dontSendNotification);
             }
         }
@@ -872,7 +880,7 @@ private:
             plugin.setParameter("operation", 1);
         }
         analyzing = false;
-        discard(trackName(identity) + utf8(" é a Principal. Reproduza o trecho e clique em ANALYZER."));
+        discard(rows[index].name + utf8(" é a Principal. Reproduza o trecho e clique em ANALYZER."));
         timerCallback();
     }
 
@@ -931,13 +939,14 @@ private:
     {
         bool same = pick.getNumItems() == static_cast<int>(rows.size());
         for (int i = 0; same && i < pick.getNumItems(); ++i)
-            same = pick.getItemId(i) == static_cast<int>(rows[static_cast<std::size_t>(i)].identity);
+            same = pick.getItemId(i) == static_cast<int>(rows[static_cast<std::size_t>(i)].identity)
+                && pick.getItemText(i) == rows[static_cast<std::size_t>(i)].name;
         if (!same)
         {
             const auto selected = pick.getSelectedId();
             pick.clear(juce::dontSendNotification);
             for (const auto& row : rows)
-                pick.addItem(trackName(row.identity), static_cast<int>(row.identity));
+                pick.addItem(row.name, static_cast<int>(row.identity));
             pick.setSelectedId(selected, juce::dontSendNotification);
             if (pick.getSelectedId() == 0 && !rows.empty())
                 pick.setSelectedItemIndex(0, juce::dontSendNotification);
@@ -972,8 +981,8 @@ private:
         if (otherRow >= 0)
         {
             const auto band = strongest.band;
-            tonalStatus = trackName(rows[static_cast<std::size_t>(otherRow)].identity)
-                + " / " + trackName(rows[static_cast<std::size_t>(focusRow)].identity)
+            tonalStatus = rows[static_cast<std::size_t>(otherRow)].name
+                + " / " + rows[static_cast<std::size_t>(focusRow)].name
                 + utf8("  ·  ") + juce::String(juce::roundToInt(nx::frequency(band))) + utf8("–")
                 + juce::String(juce::roundToInt(nx::frequency(band + 1))) + " Hz";
         }
