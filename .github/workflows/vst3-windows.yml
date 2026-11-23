@@ -1,0 +1,45 @@
+name: VST3 Windows x64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Configure MSVC x64
+        run: cmake --preset windows-x64
+      - name: Build Release
+        run: cmake --build --preset windows-release --parallel 2
+      - name: Run DSP tests
+        run: ctest --preset windows-release --no-tests=error
+      - name: Verify and package VST3
+        shell: pwsh
+        run: |
+          $bundle = 'out/windows-x64/NXMixPilot_artefacts/Release/VST3/NX Audio MixPilot.vst3'
+          $binary = Join-Path $bundle 'Contents/x86_64-win/NX Audio MixPilot.vst3'
+          if (!(Test-Path -LiteralPath $binary -PathType Leaf)) { throw "VST3 binary missing: $binary" }
+          $reader = [IO.BinaryReader]::new([IO.File]::OpenRead((Resolve-Path -LiteralPath $binary).Path))
+          try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Expected the MZ signature' }
+            $reader.BaseStream.Position = 0x3C
+            $reader.BaseStream.Position = $reader.ReadUInt32()
+            if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) {
+              throw 'The plug-in is not a Windows AMD64 PE binary'
+            }
+          } finally {
+            $reader.Dispose()
+          }
+          Compress-Archive -LiteralPath $bundle -DestinationPath 'NX-MixPilot-VST3-Windows-x64.zip'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NX-MixPilot-VST3-Windows-x64
+          path: NX-MixPilot-VST3-Windows-x64.zip
+          if-no-files-found: error
