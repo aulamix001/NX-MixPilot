@@ -373,9 +373,10 @@ public:
         for (int i = 0; i < visibleRows; ++i)
         {
             auto& button = principalButtons[static_cast<std::size_t>(i)];
-            configureButton(button, "Principal", [this, i] { choosePrincipal(i); });
-            button.setBounds(119, 447 + i * 30, 58, 24);
-            button.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff126476));
+            button.setClickingTogglesState(false);
+            button.onClick = [this, i] { choosePrincipal(i); };
+            button.setBounds(650, 447 + i * 30, 27, 24);
+            addAndMakeVisible(button);
         }
         configureButton(analyze, "ANALYZER", [this] { startAnalysis(); });
         analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
@@ -531,7 +532,7 @@ public:
             label(g, utf8("DIAGNÓSTICO TONAL"), 721, 411, 297, 19, 14, otherRow >= 0 ? amber : cyan, true);
             const auto detail = otherRow >= 0 ? tonalStatus
                 : focusRow >= 0 ? utf8("Aguardando comparação sincronizada.")
-                                : "Marque uma pista ativa como Foco.";
+                                : "Marque Foco na linha da pista desejada.";
             label(g, detail, 721, 431, 304, 23, 13, ink);
             label(g, otherRow >= 0 ? utf8("Sobreposição candidata · sem EQ aplicado") : utf8("A comparação usa a posição do host."),
                   721, 453, 304, 16, 11);
@@ -771,7 +772,9 @@ private:
         label(g, "Pico dBFS", 327, 428, 68, 16, 11);
         label(g, "Sug. dB", 413, 428, 60, 16, 11);
         label(g, "Trim dB", 488, 428, 62, 16, 11);
-        label(g, "Sinal / margem", 557, 428, 117, 16, 11);
+        label(g, "Sinal / margem", 557, 428, 92, 16, 11);
+        if (plugin.hub())
+            label(g, "Foco", 650, 428, 31, 16, 11, cyan);
         if (rows.empty())
             label(g, utf8("Adicione instâncias Track às pistas, com a mesma sessão deste HUB."), 31, 464, 644, 32);
         if (rows.size() > visibleRows)
@@ -795,7 +798,7 @@ private:
                 g.setColour(spectrumColour(row));
                 g.fillEllipse(26.0f, y + 11.0f, 6.0f, 6.0f);
             }
-            label(g, row.name + " / G" + juce::String(row.group), 36, top, 81, 28, 13, ink);
+            label(g, row.name + " / G" + juce::String(row.group), 36, top, plugin.hub() ? 140 : 84, 28, 13, ink);
             if (!plugin.hub() && row.role == nx::focus)
                 badge(g, "Foco", 124, top + 3, 43, cyan);
             const bool signal = row.current && row.reading.peak > -90;
@@ -817,7 +820,7 @@ private:
             const juce::String state = !signal ? "Sem sinal" : !row.reading.active() ? "Medindo"
                 : row.proposed.headroomUnmet ? "Margem insuficiente"
                 : row.proposed.headroomLimited ? "Limitado pelo pico" : row.adjusted ? "Ajustada" : "Ativo";
-            label(g, state, 557, top, 123, 28, 12, row.proposed.headroomLimited ? amber : muted);
+            label(g, state, 557, top, plugin.hub() ? 90 : 123, 28, 12, row.proposed.headroomLimited ? amber : muted);
         }
     }
 
@@ -901,7 +904,8 @@ private:
             if (present)
             {
                 const auto& row = rows[index];
-                button.setTitle("Marcar " + row.name + " como Principal");
+                button.setTitle("Marcar " + row.name + " como Foco");
+                button.setTooltip("Usar " + row.name + " como pista de foco e principal");
                 button.setToggleState(row.role == nx::focus, juce::dontSendNotification);
             }
         }
@@ -1263,7 +1267,7 @@ private:
     juce::ComboBox instance, role, operation, scope, pick, support;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
-    std::array<juce::TextButton, visibleRows> principalButtons;
+    std::array<juce::ToggleButton, visibleRows> principalButtons;
     juce::ToggleButton bypass;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
