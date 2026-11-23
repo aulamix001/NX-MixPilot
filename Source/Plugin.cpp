@@ -1,4 +1,5 @@
 #include "Analysis.h"
+#include "GlassLook.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
@@ -288,6 +289,7 @@ public:
     explicit Editor(Processor& processor)
         : AudioProcessorEditor(processor), plugin(processor)
     {
+        setLookAndFeel(&glass);
         using ComboAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
         using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
         auto attachChoice = [&](juce::ComboBox& control, const char* parameter, juce::StringArray labels)
@@ -312,12 +314,32 @@ public:
         attachSlider(trim, "trim", " dB");
         attachSlider(reference, "reference", " dBFS");
         attachSlider(limit, "limit", " dB");
+        attachSlider(trackLimit, "limit", " dB");
         attachSlider(headroom, "headroom", " dB");
+        for (auto* knob : {&limit, &trim})
+        {
+            knob->setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+            knob->setTextBoxStyle(juce::Slider::TextBoxBelow, false, 84, 24);
+        }
+        limit.setTitle("Limite de trim");
+        trim.setTitle("Trim interno");
 
         scope.addItemList({"Uma pista", "Um grupo", "Todas as pistas"}, 1);
         scope.setSelectedId(1);
         addAndMakeVisible(scope);
         addAndMakeVisible(pick);
+        pick.onChange = [this]
+        {
+            const auto chosen = std::find_if(rows.begin(), rows.end(), [this](const auto& row)
+                { return row.identity == static_cast<unsigned>(pick.getSelectedId()); });
+            if (chosen != rows.end())
+            {
+                const auto index = static_cast<int>(chosen - rows.begin());
+                if (index < firstRow || index >= firstRow + visibleRows)
+                    firstRow = std::max(0, index - visibleRows + 1);
+            }
+            repaint();
+        };
         configureButton(analyze, "ANALYZE", [this] { startAnalysis(); });
         analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
         analyze.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
@@ -325,6 +347,7 @@ public:
         analyze.setTooltip(utf8("Analisa e aplica o trim individual de cada pista ativa da sessão."));
         configureButton(review, utf8("Capturar prévia"), [this] { capture(); });
         configureButton(apply, "Aplicar trim", [this] { commit(); });
+        apply.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff135f72));
         configureButton(audition, "Ouvir B", [this] { togglePreview(); });
         configureButton(undo, "Desfazer", [this] { undoLast(); });
         configureButton(cancel, "Cancelar", [this]
@@ -339,7 +362,7 @@ public:
         bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
             plugin.parameters, "bypass", bypass);
 
-        setSize(1050, 685);
+        setSize(1050, 710);
         timerCallback();
         startTimerHz(12);
     }
@@ -347,192 +370,354 @@ public:
     ~Editor() override
     {
         stopTimer();
+        setLookAndFeel(nullptr);
         std::lock_guard<std::mutex> lock(registry().mutex);
         clearPreview();
     }
 
     void resized() override
     {
-        instance.setBounds(845, 25, 100, 30);
-        bypass.setBounds(954, 25, 85, 30);
-        session.setBounds(95, 82, 160, 28);
-        operation.setBounds(282, 82, 188, 28);
-        reference.setBounds(588, 82, 143, 28);
-        limit.setBounds(826, 82, 191, 28);
-        role.setBounds(345, 82, 125, 28);
-        trim.setBounds(588, 82, 143, 28);
-        group.setBounds(826, 120, 191, 28);
-        headroom.setBounds(588, 120, 143, 28);
-        scope.setBounds(24, 120, 140, 28);
-        pick.setBounds(174, 120, 180, 28);
-        analyze.setBounds(24, 604, 145, 32);
-        review.setBounds(179, 604, 155, 32);
-        audition.setBounds(344, 604, 115, 32);
-        cancel.setBounds(469, 604, 115, 32);
-        undo.setBounds(690, 604, 120, 32);
-        apply.setBounds(820, 604, 197, 32);
+        instance.setBounds(853, 16, 94, 30);
+        bypass.setBounds(954, 16, 82, 30);
+        session.setBounds(72, 75, 122, 27);
+        operation.setBounds(207, 75, 177, 27);
+        reference.setBounds(474, 75, 119, 27);
+        headroom.setBounds(671, 75, 118, 27);
+        trackLimit.setBounds(530, 113, 126, 27);
+        scope.setBounds(16, 114, 142, 26);
+        pick.setBounds(168, 114, 146, 26);
+        group.setBounds(plugin.hub() ? 222 : 459, plugin.hub() ? 114 : 75, 125, 26);
+        role.setBounds(267, 75, 122, 27);
+        trim.setBounds(807, 494, 128, 130);
+        limit.setBounds(trim.getBounds());
+
+        analyze.setBounds(16, 652, 127, 34);
+        review.setBounds(153, 652, 146, 34);
+        audition.setBounds(309, 652, 116, 34);
+        cancel.setBounds(435, 652, 99, 34);
+        undo.setBounds(753, 652, 119, 34);
+        apply.setBounds(882, 652, 152, 34);
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
+    {
+        if (!plugin.hub() || !juce::Rectangle<int>(12, 422, 684, 210).contains(event.getPosition()))
+            return;
+        firstRow = juce::jlimit(0, std::max(0, static_cast<int>(rows.size()) - visibleRows),
+                               firstRow + (wheel.deltaY > 0 ? -1 : wheel.deltaY < 0 ? 1 : 0));
+        repaint();
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        if (!plugin.hub() || !juce::Rectangle<int>(20, 445, 667, 180).contains(event.getPosition()))
+            return;
+        const auto index = firstRow + (event.y - 445) / 30;
+        if (index < static_cast<int>(rows.size()))
+            pick.setSelectedId(static_cast<int>(rows[static_cast<std::size_t>(index)].identity),
+                               juce::sendNotificationSync);
     }
 
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour(0xff0c131d));
-        g.setColour(juce::Colour(0xff152131));
-        g.fillRect(0, 0, getWidth(), 66);
-        label(g, "NX AUDIO   /   MixPilot", 24, 12, 490, 48, 31, cyan);
-        label(g, plugin.hub() ? utf8("HUB   ·   ") + juce::String(rows.size()) + utf8(" pistas na sessão")
-                              : trackName(plugin.identity) + utf8("   ·   Track"),
-              533, 16, 301, 42, 17, ink);
-        label(g, utf8("Sessão"), 24, 82, 65, 28);
-        label(g, plugin.hub() ? "Limite de trim" : "Grupo", 742, plugin.hub() ? 82 : 120, 82, 28);
-        if (plugin.hub())
+        using namespace juce;
+        const bool hubMode = plugin.hub();
+        g.fillAll(Colour(0xff080e16));
+        ColourGradient ambient(Colour(0xff18364a), 172, 60, Colour(0xff090e17), 798, 643, true);
+        ambient.addColour(0.43, Colour(0xff122333));
+        g.setGradientFill(ambient);
+        g.fillAll();
+        panel(g, 5, 5, 1040, 55);
+        label(g, "NX", 21, 10, 52, 40, 34, cyan, true);
+        label(g, "AUDIO", 77, 15, 73, 32, 17, ink, true);
+        g.setColour(Colour(0xff476777));
+        g.drawVerticalLine(157, 17, 44);
+        label(g, "MixPilot", 175, 10, 122, 40, 28, ink, true);
+        badge(g, hubMode ? "HUB" : "TRACK", 307, 19, 66, cyan);
+        const auto active = std::count_if(rows.begin(), rows.end(), [](const auto& row) { return row.current && row.reading.active(); });
+        const auto subtitle = hubMode ? juce::String(active) + "/" + juce::String(rows.size()) + " pistas com sinal"
+                                      : trackName(plugin.identity);
+        label(g, subtitle, 405, 17, 255, 30, 14, ink);
+        label(g, utf8("Instância"), 782, 18, 66, 28);
+
+        panel(g, 12, 68, 1026, 41);
+        label(g, utf8("Sessão"), 22, 75, 48, 27, 13);
+        if (hubMode)
         {
-            label(g, mode() == nx::GainMode::calibration ? "0 VU (RMS)" : utf8("Âncora: nível atual do Foco"), 488, 82, 239, 28);
-            label(g, "Headroom", 488, 120, 92, 28);
+            label(g, mode() == nx::GainMode::calibration ? "0 VU RMS" : utf8("Âncora: pista de Foco"), 400, 75, 190, 27, 13);
+            label(g, "Headroom", 600, 75, 68, 27, 13);
+            label(g, utf8("Escopo da prévia"), 362, 114, 160, 26, 13);
             if (scope.getSelectedId() == 2)
-                label(g, "Grupo", 742, 120, 82, 28);
+                label(g, "Grupo", 172, 114, 48, 26, 13);
         }
         else
         {
-            label(g, "Papel", 282, 82, 60, 28);
-            label(g, "Trim interno", 488, 82, 100, 28);
+            label(g, "Papel", 216, 75, 50, 27, 13);
+            label(g, "Grupo", 409, 75, 50, 27, 13);
+            label(g, "0 VU RMS", 22, 113, 70, 27, 13);
+            label(g, "Headroom", 229, 113, 69, 27, 13);
+            label(g, "Limite de trim", 433, 113, 95, 27, 13);
+            label(g, utf8("HUB controla a sessão pelo master."), 681, 113, 348, 27, 13);
         }
 
-        panel(g, 24, 168, 675, 205);
-        panel(g, 715, 168, 302, 205);
-        label(g, utf8("ESPECTRO  /  20 Hz — 20 kHz"), 39, 178, 640, 26, 17, cyan);
-        label(g, plugin.hub() ? "MIX BUS" : utf8("MEDIÇÃO DA PISTA"), 730, 178, 275, 26, 17, cyan);
+        panel(g, 12, 150, 684, 244);
+        panel(g, 707, 150, 331, 244);
+        label(g, hubMode ? utf8("ESPECTRO DA SESSÃO") : "ESPECTRO DA PISTA", 26, 159, 300, 28, 17, ink, true);
+        label(g, hubMode ? "MIX BUS" : utf8("MEDIÇÃO DA PISTA"), 721, 159, 297, 28, 17, ink, true);
         drawSpectrum(g);
-        if (localCurrent)
-        {
-            label(g, utf8("Nível RMS     ") + number(local.rms) + " dBFS", 730, 211, 265, 25, 16, ink);
-            label(g, "Pico entrada     " + number(local.peak) + " dBFS", 730, 241, 265, 25);
-            label(g, utf8("Pico saída       ") + number(local.outputPeak) + " dBFS", 730, 268, 265, 25);
-            label(g, utf8("Margem saída   ") + number(-local.outputPeak) + " dB", 730, 295, 265, 25);
-        }
-        else
-            label(g, "Sem dados recentes", 730, 215, 265, 28);
-        label(g, "Medidores de pico de amostra", 730, 332, 265, 25);
+        drawMeters(g);
 
-        panel(g, 24, 386, 993, 203);
-        if (plugin.hub())
+        panel(g, 12, 404, 684, 231);
+        panel(g, 707, 404, 331, 73);
+        panel(g, 707, 485, 331, 150);
+        if (hubMode)
         {
-            label(g, "PISTAS   /   TRIM INTERNO", 39, 394, 460, 26, 17, cyan);
-            label(g, "RMS (dBFS)", 233, 422, 126, 23);
-            label(g, "Pico (dBFS)", 365, 422, 120, 23);
-            label(g, utf8("Sugestão (dB)"), 491, 422, 125, 23);
-            label(g, "Aplicado (dB)", 628, 422, 120, 23);
-            label(g, "Estado", 750, 422, 250, 23);
+            label(g, utf8("BALANÇO POR PISTA"), 26, 407, 400, 23, 17, ink, true);
             drawRows(g);
+            label(g, utf8("DIAGNÓSTICO TONAL"), 721, 411, 297, 19, 14, otherRow >= 0 ? amber : cyan, true);
+            const auto detail = otherRow >= 0 ? tonalStatus
+                : focusRow >= 0 ? utf8("Aguardando comparação sincronizada.")
+                                : "Marque uma pista ativa como Foco.";
+            label(g, detail, 721, 431, 304, 23, 13, ink);
+            label(g, otherRow >= 0 ? utf8("Sobreposição candidata · sem EQ aplicado") : utf8("A comparação usa a posição do host."),
+                  721, 453, 304, 16, 11);
+            label(g, "LIMITE DE TRIM", 721, 494, 100, 20, 12, cyan, true);
         }
         else
         {
-            label(g, "TRACK  /  TRIM INTERNO", 39, 398, 940, 30, 17, cyan);
-            label(g, utf8("Escolha um grupo e use o HUB na mesma sessão para calibrar ou balancear."), 39, 446, 940, 27);
-            label(g, utf8("Auto reconhece predominância de graves. Para definir a prioridade musical, selecione Foco."), 39, 478, 940, 27);
-            label(g, utf8("A medição usa RMS digital e pico de amostra."), 39, 510, 940, 27);
+            label(g, utf8("BALANÇO LOCAL"), 26, 407, 630, 23, 17, ink, true);
+            drawRows(g);
+            label(g, utf8("Auto detecta graves predominantes. Use Foco para definir a prioridade musical no HUB."),
+                  28, 532, 641, 27, 14);
+            label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);
+            label(g, utf8("Sessão ") + juce::String(plugin.session()) + "  /  Grupo " + juce::String(plugin.group()),
+                  721, 436, 297, 25, 15, ink);
+            label(g, "TRIM INTERNO", 721, 494, 95, 20, 12, cyan, true);
         }
-        label(g, status, 24, 640, 993, 30, 14, ink);
+
+        panel(g, 5, 644, 1040, 63);
+        label(g, status, 17, 685, 1016, 18, 13, analyzing ? 0xff63f69e : ink);
     }
 
 private:
     nx::GainMode mode() const
     {
-        return plugin.value("operation") < 0.5f ? nx::GainMode::calibration : nx::GainMode::musical;
+        return !plugin.hub() || plugin.value("operation") < 0.5f ? nx::GainMode::calibration : nx::GainMode::musical;
     }
 
     static void label(juce::Graphics& g, const juce::String& text, int x, int y, int w, int h,
-                      float size = 14, juce::uint32 colour = muted)
+                      float size = 14, juce::uint32 colour = muted, bool strong = false)
     {
         g.setColour(juce::Colour(colour));
-        g.setFont(juce::Font(juce::FontOptions(size)));
+        g.setFont(juce::Font(juce::FontOptions(size, strong ? juce::Font::bold : juce::Font::plain)));
         g.drawFittedText(text, x, y, w, h, juce::Justification::centredLeft, 1);
     }
 
     static void panel(juce::Graphics& g, int x, int y, int w, int h)
     {
-        juce::Rectangle<float> area(static_cast<float>(x), static_cast<float>(y),
-                                    static_cast<float>(w), static_cast<float>(h));
-        g.setColour(juce::Colour(0xff121e2b));
-        g.fillRoundedRectangle(area, 8);
-        g.setColour(juce::Colour(0xff304052));
-        g.drawRoundedRectangle(area, 8, 1);
+        const juce::Rectangle<float> area(static_cast<float>(x), static_cast<float>(y),
+                                           static_cast<float>(w), static_cast<float>(h));
+        g.setColour(juce::Colour(0x74030409));
+        g.fillRoundedRectangle(area.translated(0, 2), 10);
+        g.setGradientFill({juce::Colour(0xba1c2a3a), area.getX(), area.getY(),
+                           juce::Colour(0xe00a121c), area.getRight(), area.getBottom(), false});
+        g.fillRoundedRectangle(area, 10);
+        g.setGradientFill({juce::Colour(0xaf566f87), area.getX(), area.getY(),
+                           juce::Colour(0x94314354), area.getX(), area.getBottom(), false});
+        g.drawRoundedRectangle(area.reduced(0.5f), 10, 1);
+    }
+
+    static void badge(juce::Graphics& g, const juce::String& caption, int x, int y,
+                      int width, juce::uint32 tint)
+    {
+        const juce::Rectangle<float> area(static_cast<float>(x), static_cast<float>(y),
+                                           static_cast<float>(width), 22.0f);
+        const juce::Colour color(tint);
+        g.setColour(color.withAlpha(0.12f));
+        g.fillRoundedRectangle(area, 5);
+        g.setColour(color.withAlpha(0.65f));
+        g.drawRoundedRectangle(area, 5, 1);
+        label(g, caption, x + 7, y, width - 14, 22, 12, tint, true);
+    }
+
+    bool localSignal() const
+    {
+        return localCurrent && local.peak > -90.0f;
+    }
+
+    static void drawSegments(juce::Graphics& g, juce::Rectangle<float> area, float level,
+                             int steps, bool vertical)
+    {
+        const auto dimension = vertical ? area.getHeight() : area.getWidth();
+        const auto increment = dimension / static_cast<float>(steps);
+        for (int i = 0; i < steps; ++i)
+        {
+            const float threshold = -48.0f + 48.0f * (i + 0.5f) / steps;
+            const auto color = threshold >= -3.0f ? juce::Colour(0xffff8551)
+                : threshold >= -12.0f ? juce::Colour(0xffffd24c)
+                                     : juce::Colour(0xff43ef8b).interpolatedWith(juce::Colour(0xff15a8a9),
+                                                                                std::max(0.0f, -threshold / 48.0f));
+            const auto segment = vertical ? juce::Rectangle<float>(area.getX(), area.getBottom() - increment * (i + 1),
+                                                                     area.getWidth(), increment - 1.4f)
+                : juce::Rectangle<float>(area.getX() + increment * i, area.getY(),
+                                           increment - 1.3f, area.getHeight());
+            g.setColour(level >= threshold ? color : juce::Colour(0xff243241));
+            g.fillRoundedRectangle(segment, 1.0f);
+        }
+    }
+
+    void drawMeters(juce::Graphics& g) const
+    {
+        const bool signal = localSignal();
+        for (const auto& meter : {juce::Rectangle<float>(754, 192, 27, 155),
+                                 juce::Rectangle<float>(805, 192, 27, 155)})
+        {
+            g.setColour(juce::Colour(0xff091018));
+            g.fillRoundedRectangle(meter.expanded(4), 5);
+            g.setColour(juce::Colour(0xff344c61));
+            g.drawRoundedRectangle(meter.expanded(4), 5, 1);
+        }
+        drawSegments(g, {754, 192, 27, 155}, signal ? local.peak : nx::floorDb, 28, true);
+        drawSegments(g, {805, 192, 27, 155}, signal ? local.outputPeak : nx::floorDb, 28, true);
+        for (int i = 0; i <= 4; ++i)
+            label(g, juce::String(-12 * i), 720, 185 + i * 39, 25, 14, 11);
+        label(g, "Entrada", 747, 355, 56, 22, 11, ink);
+        label(g, utf8("Saída"), 804, 355, 48, 22, 11, ink);
+
+        const auto dash = utf8("—");
+        auto metric = [&](const juce::String& caption, const juce::String& value, int y)
+        {
+            panel(g, 855, y, 166, 51);
+            label(g, caption, 866, y + 4, 151, 18, 12);
+            label(g, value, 866, y + 23, 151, 24, 19, ink, true);
+        };
+        metric("RMS de entrada", signal ? number(local.rms) + " dBFS" : dash, 190);
+        metric(utf8("Pico de amostra · saída"), signal ? number(local.outputPeak) + " dBFS" : dash, 250);
+        metric("Headroom", signal ? number(-local.outputPeak) + " dB" : dash, 310);
     }
 
     void drawSpectrum(juce::Graphics& g) const
     {
-        const juce::Rectangle<float> plot(50, 212, 625, 116);
-        for (int i = 0; i <= 6; ++i)
-        {
-            g.setColour(juce::Colour(0xff2a3b4a));
-            const auto x = plot.getX() + plot.getWidth() * i / 6.0f;
-            g.drawVerticalLine(static_cast<int>(x), plot.getY(), plot.getBottom());
-        }
+        const juce::Rectangle<float> plot(62, 194, 612, 163);
+        g.setColour(juce::Colour(0x9c080f17));
+        g.fillRect(plot);
+        const auto xFor = [&](float hz) { return plot.getX() + plot.getWidth() * std::log10(hz / 20.0f) / 3.0f; };
+        for (int decade = 0; decade < 3; ++decade)
+            for (int division = 1; division < 10; ++division)
+            {
+                g.setColour(juce::Colour(division == 1 ? 0xff344959 : 0xff23313e));
+                const int x = juce::roundToInt(xFor(20.0f * division * std::pow(10.0f, decade)));
+                g.drawVerticalLine(x, plot.getY(), plot.getBottom());
+            }
         for (int i = 0; i <= 4; ++i)
         {
-            g.setColour(juce::Colour(0xff2a3b4a));
-            const auto y = plot.getY() + plot.getHeight() * i / 4.0f;
-            g.drawHorizontalLine(static_cast<int>(y), plot.getX(), plot.getRight());
+            const auto y = juce::roundToInt(plot.getY() + plot.getHeight() * i / 4.0f);
+            g.setColour(juce::Colour(0xff344959));
+            g.drawHorizontalLine(y, plot.getX(), plot.getRight());
+            label(g, juce::String(-20 * i), 27, y - 8, 29, 16, 11);
         }
-        auto trace = [&](const nx::Reading& reading, juce::uint32 color)
+        const auto trace = [&](const nx::Reading& reading, juce::uint32 tint)
         {
             juce::Path curve;
+            float firstX = plot.getX(), lastX = firstX;
             for (int i = 0; i < nx::bands; ++i)
             {
-                const float decibels = nx::db(std::sqrt(reading.power[i]));
+                const auto decibels = nx::db(std::sqrt(reading.power[i]));
                 const auto x = plot.getX() + plot.getWidth() * (i + 0.5f) / nx::bands;
                 const auto y = plot.getY() + plot.getHeight() * std::clamp(-decibels / 80.0f, 0.0f, 1.0f);
                 if (i == 0)
+                {
+                    firstX = x;
                     curve.startNewSubPath(x, y);
+                }
                 else
                     curve.lineTo(x, y);
+                lastX = x;
             }
-            g.setColour(juce::Colour(color));
-            g.strokePath(curve, juce::PathStrokeType(2));
+            const juce::Colour color(tint);
+            auto fill = curve;
+            fill.lineTo(lastX, plot.getBottom());
+            fill.lineTo(firstX, plot.getBottom());
+            fill.closeSubPath();
+            g.setGradientFill({color.withAlpha(0.43f), plot.getX(), plot.getY() + 40.0f,
+                               color.withAlpha(0.035f), plot.getX(), plot.getBottom(), false});
+            g.fillPath(fill);
+            g.setColour(color.withAlpha(0.16f));
+            g.strokePath(curve, juce::PathStrokeType(5));
+            g.setColour(color);
+            g.strokePath(curve, juce::PathStrokeType(1.65f));
         };
-        if (focusRow >= 0)
-            trace(rows[static_cast<std::size_t>(focusRow)].reading, cyan);
-        else if (localCurrent)
-            trace(local, cyan);
         if (otherRow >= 0)
-            trace(rows[static_cast<std::size_t>(otherRow)].reading, 0xffffb84d);
-        label(g, "20 Hz", 51, 310, 65, 17);
-        label(g, "200 Hz", 246, 310, 63, 17);
-        label(g, "2 kHz", 451, 310, 63, 17);
-        label(g, "20 kHz", 607, 310, 67, 17);
-        label(g, tonalStatus, 39, 337, 640, 25);
+        {
+            const auto& other = rows[static_cast<std::size_t>(otherRow)];
+            trace(other.reading, amber);
+            label(g, trackName(other.identity), 566, 161, 108, 24, 12, amber);
+        }
+        if (focusRow >= 0)
+        {
+            const auto& focus = rows[static_cast<std::size_t>(focusRow)];
+            trace(focus.reading, cyan);
+            label(g, trackName(focus.identity) + " (Foco)", 421, 161, 135, 24, 12, cyan);
+        }
+        else if (localSignal())
+        {
+            trace(local, cyan);
+            label(g, plugin.hub() ? "Mix bus" : "Entrada", 565, 161, 105, 24, 12, cyan);
+        }
+        else
+            label(g, "Aguardando sinal", 309, 257, 168, 20, 14, ink);
+
+        constexpr std::array<float, 7> ticks {20, 60, 200, 600, 2000, 6000, 20000};
+        const std::array<juce::String, 7> captions {"20 Hz", "60", "200", "600", "2 kHz", "6 kHz", "20 kHz"};
+        for (std::size_t i = 0; i < ticks.size(); ++i)
+            label(g, captions[i], std::min(636, juce::roundToInt(xFor(ticks[i])) - 10), 360, 57, 20, 11);
     }
 
     void drawRows(juce::Graphics& g)
     {
         const auto selected = static_cast<unsigned>(pick.getSelectedId());
-        auto rowIndex = std::find_if(rows.begin(), rows.end(), [selected](const auto& row)
-            { return row.identity == selected; });
-        const auto start = std::max<std::ptrdiff_t>(0, rowIndex - rows.begin() - 3);
-        const auto first = std::min(start, std::max<std::ptrdiff_t>(0, static_cast<std::ptrdiff_t>(rows.size()) - 5));
-        int y = 450;
+        label(g, "Pista", 34, 428, 130, 16, 11);
+        label(g, "RMS dBFS", 248, 428, 68, 16, 11);
+        label(g, "Pico dBFS", 327, 428, 68, 16, 11);
+        label(g, "Sug. dB", 413, 428, 60, 16, 11);
+        label(g, "Trim dB", 488, 428, 62, 16, 11);
+        label(g, "Sinal / margem", 557, 428, 117, 16, 11);
         if (rows.empty())
-            label(g, utf8("Insira o MixPilot em modo Track nas pistas e use o mesmo número de sessão."), 39, y, 930, 25);
-        for (auto index = first; index < static_cast<std::ptrdiff_t>(rows.size()) && y <= 554; ++index, y += 26)
+            label(g, utf8("Adicione instâncias Track às pistas, com a mesma sessão deste HUB."), 31, 464, 644, 32);
+        if (rows.size() > visibleRows)
+            label(g, juce::String(firstRow + 1) + "-" + juce::String(firstRow + visibleRows) + " / "
+                      + juce::String(rows.size()), 602, 411, 79, 16, 11, cyan);
+        for (int i = 0; i < visibleRows && firstRow + i < static_cast<int>(rows.size()); ++i)
         {
-            const auto& row = rows[static_cast<std::size_t>(index)];
+            const auto& row = rows[static_cast<std::size_t>(firstRow + i)];
+            const float y = 445.0f + i * 30.0f;
+            const juce::Rectangle<float> strip(20, y, 666, 28);
+            g.setColour(juce::Colour(row.identity == selected ? 0xff1c3547 : 0x58172331));
+            g.fillRoundedRectangle(strip, 5);
             if (row.identity == selected)
             {
-                g.setColour(juce::Colour(0xff1e3445));
-                g.fillRect(34, y, 969, 25);
+                g.setColour(juce::Colour(0xff408ca1));
+                g.drawRoundedRectangle(strip, 5, 1);
             }
-            auto tag = row.role == nx::focus ? utf8(" · Foco") : "";
-            label(g, trackName(row.identity) + tag + "  /  G" + juce::String(row.group), 39, y, 182, 25, 14, ink);
-            label(g, row.current ? number(row.reading.rms) : utf8("—"), 233, y, 122, 25);
-            label(g, row.current ? number(row.reading.peak) : utf8("—"), 365, y, 122, 25);
+            const int top = static_cast<int>(y);
+            label(g, trackName(row.identity) + " / G" + juce::String(row.group), 31, top, 99, 28, 13, ink);
+            if (row.role == nx::focus)
+                badge(g, "Foco", 124, top + 3, 43, cyan);
+            const bool signal = row.current && row.reading.peak > -90;
+            drawSegments(g, {174, y + 9, 60, 10}, signal ? row.reading.rms : nx::floorDb, 10, false);
+            const auto dash = utf8("—");
+            label(g, signal ? number(row.reading.rms) : dash, 248, top, 75, 28, 13);
+            label(g, signal ? number(row.reading.peak) : dash, 327, top, 75, 28, 13);
             const auto frozen = std::find_if(pending.begin(), pending.end(),
                 [&](const auto& change) { return change.identity == row.identity; });
-            const auto suggestion = pending.empty() ? (canSuggest(row) ? number(row.proposed.trim) : utf8("—"))
-                : frozen == pending.end() ? juce::String(utf8("—")) : number(frozen->next);
-            label(g, suggestion, 491, y, 125, 25, 14, frozen != pending.end() ? cyan : muted);
-            label(g, number(row.trim), 628, y, 120, 25);
-            const juce::String state = !row.current ? "Sem dados / bypass" : !row.reading.active() ? "Abaixo do limiar"
-                : row.proposed.headroomUnmet ? utf8("Margem inviável no limite") : row.proposed.headroomLimited ? "Limitado pelo pico" : "Sinal ativo";
-            label(g, state, 750, y, 250, 25);
+            const auto suggestion = pending.empty() ? (canSuggest(row) ? number(row.proposed.trim) : dash)
+                : frozen == pending.end() ? dash : number(frozen->next);
+            label(g, suggestion, 413, top, 74, 28, 13, frozen != pending.end() ? cyan : muted);
+            label(g, number(row.trim), 488, top, 65, 28, 13, ink);
+            const juce::String state = !signal ? "Sem sinal" : !row.reading.active() ? "Medindo"
+                : row.proposed.headroomUnmet ? "Margem insuficiente"
+                : row.proposed.headroomLimited ? "Limitado pelo pico" : "Ativo";
+            label(g, state, 557, top, 123, 28, 12, row.proposed.headroomLimited ? amber : muted);
         }
     }
 
@@ -550,38 +735,52 @@ private:
 
     void timerCallback() override
     {
-        if ((!plugin.hub() || plugin.session() != capturedSession || plugin.value("bypass") > 0.5f)
+        if ((plugin.hub() != capturedHub || plugin.session() != capturedSession || plugin.value("bypass") > 0.5f)
             && !pending.empty())
             discard(utf8("Prévia cancelada após alteração de sessão, instância ou bypass."));
 
         const bool isHub = plugin.hub();
-        for (auto* control : std::initializer_list<juce::Component*>{
-                  &operation, &reference, &headroom, &limit, &scope, &analyze, &review, &apply, &cancel, &audition, &undo})
-            control->setVisible(isHub);
-        reference.setVisible(isHub && mode() == nx::GainMode::calibration);
+        operation.setVisible(isHub);
+        scope.setVisible(isHub);
+        limit.setVisible(isHub);
+        reference.setVisible(mode() == nx::GainMode::calibration);
+        reference.setBounds(isHub ? 474 : 95, isHub ? 75 : 113, 119, 27);
+        headroom.setBounds(isHub ? 671 : 304, isHub ? 75 : 113, 118, 27);
+        trackLimit.setVisible(!isHub);
         pick.setVisible(isHub && scope.getSelectedId() == 1);
         group.setVisible(!isHub || scope.getSelectedId() == 2);
+        group.setBounds(isHub ? 222 : 459, isHub ? 114 : 75, 125, 26);
         role.setVisible(!isHub);
         trim.setVisible(!isHub);
 
         localCurrent = plugin.measurement.read(local, plugin.session());
         rows.clear();
         focusRow = otherRow = -1;
+        auto append = [&](Processor& track)
         {
-            std::lock_guard<std::mutex> lock(registry().mutex);
-            if (isHub)
+            TrackRow row {track.identity, track.group(), track.role(), track.value("trim"), false, {}, {}};
+            row.current = track.eligible(plugin.session())
+                && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
+            rows.push_back(row);
+        };
+        if (isHub)
+        {
+            {
+                std::lock_guard<std::mutex> lock(registry().mutex);
                 for (auto* track : registry().tracks)
                     if (track != nullptr && !track->hub() && track->session() == plugin.session())
-                    {
-                        TrackRow row {track->identity, track->group(), track->role(), track->value("trim"), false, {}, {}};
-                        row.current = track->eligible(plugin.session()) && track->measurement.read(row.reading, plugin.session(), &row.timestamp);
-                        rows.push_back(row);
-                    }
-        }
-        if (isHub)
+                        append(*track);
+            }
+            firstRow = std::clamp(firstRow, 0, std::max(0, static_cast<int>(rows.size()) - visibleRows));
             refreshHub();
+        }
         else
-            tonalStatus = localCurrent ? "Espectro da entrada (dBFS por banda)" : "Reproduza um trecho com sinal.";
+        {
+            firstRow = 0;
+            append(plugin);
+        }
+        updateSuggestions();
+
         finishAnalysis();
         updateButtons();
         repaint();
@@ -598,17 +797,19 @@ private:
         undo.setEnabled(!analyzing && !plugin.history.empty());
     }
 
-    std::array<float, 5> analysisSettings() const
+    std::array<float, 6> analysisSettings() const
     {
-        return {plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
+        return {plugin.value("instance"), plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
                 plugin.value("limit"), plugin.value("headroom")};
     }
 
     void startAnalysis()
     {
-        if (analyzing || !plugin.hub() || plugin.value("bypass") > 0.5f)
+        if (analyzing || plugin.value("bypass") > 0.5f)
             return;
-        discard(utf8("ANALYZE  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa."));
+        discard(plugin.hub()
+            ? utf8("ANALYZE  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
+            : utf8("ANALYZE  /  Mantenha a pista em reprodução. O trim local será ajustado."));
         requestedSettings = analysisSettings();
         analysisStarted = juce::Time::getMillisecondCounter();
         analyzing = true;
@@ -620,7 +821,7 @@ private:
     {
         if (!analyzing)
             return;
-        if (!plugin.hub() || plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
+        if (plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
         {
             analyzing = false;
             status = utf8("ANALYZE cancelado após alteração das configurações.");
@@ -680,7 +881,7 @@ private:
         if (otherRow >= 0)
         {
             const auto band = strongest.band;
-            tonalStatus = utf8("Sobreposição instantânea  ·  ") + trackName(rows[static_cast<std::size_t>(otherRow)].identity)
+            tonalStatus = trackName(rows[static_cast<std::size_t>(otherRow)].identity)
                 + " / " + trackName(rows[static_cast<std::size_t>(focusRow)].identity)
                 + utf8("  ·  ") + juce::String(juce::roundToInt(nx::frequency(band))) + utf8("–")
                 + juce::String(juce::roundToInt(nx::frequency(band + 1))) + " Hz";
@@ -690,6 +891,10 @@ private:
         else
             tonalStatus = "Marque uma pista ativa como Foco para comparar o espectro.";
 
+    }
+
+    void updateSuggestions()
+    {
         const auto focusAnchor = focusRow >= 0
             ? rows[static_cast<std::size_t>(focusRow)].reading.rms + rows[static_cast<std::size_t>(focusRow)].trim : 0.0f;
         const auto anchor = mode() == nx::GainMode::calibration ? plugin.value("reference") : focusAnchor;
@@ -710,7 +915,7 @@ private:
     {
         if (plugin.value("bypass") > 0.5f)
         {
-            status = "Desative o bypass do HUB antes de capturar.";
+            status = "Desative o bypass antes de capturar.";
             return;
         }
         const auto fresh = [&](const TrackRow& row)
@@ -728,14 +933,15 @@ private:
         }
         int skipped = 0;
         capturedSession = plugin.session();
+        capturedHub = plugin.hub();
         capturedHeadroom = plugin.value("headroom");
-        const int scopeId = automatic ? 3 : scope.getSelectedId();
+        const int scopeId = automatic || !capturedHub ? 3 : scope.getSelectedId();
         auto inScope = [&](const auto& row)
         {
             return scopeId == 1 ? row.identity == static_cast<unsigned>(pick.getSelectedId())
                 : scopeId == 2 ? row.group == plugin.group() : true;
         };
-        const bool commonCalibration = !automatic && mode() == nx::GainMode::calibration && scopeId != 1;
+        const bool commonCalibration = !automatic && capturedHub && mode() == nx::GainMode::calibration && scopeId != 1;
         nx::GroupCalibration calibration(plugin.value("limit"), capturedHeadroom);
         if (commonCalibration)
         {
@@ -889,9 +1095,13 @@ private:
             + (remaining == 0 ? juce::String{} : utf8(" Há pistas indisponíveis ou com trim alterado."));
     }
 
+    static constexpr int visibleRows = 6;
+    static constexpr juce::uint32 amber = 0xffffb64a;
+    int firstRow = 0;
     Processor& plugin;
+    GlassLook glass;
     juce::ComboBox instance, role, operation, scope, pick;
-    juce::Slider session, group, trim, reference, limit, headroom;
+    juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel;
     juce::ToggleButton bypass;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
@@ -901,10 +1111,11 @@ private:
     std::vector<Change> pending;
     nx::Reading local;
     bool localCurrent = false, listening = false, analyzing = false;
-    std::array<float, 5> requestedSettings {};
+    std::array<float, 6> requestedSettings {};
     juce::uint32 analysisStarted = 0;
     int focusRow = -1, otherRow = -1, capturedSession = 0;
     float capturedHeadroom = 0;
+    bool capturedHub = false;
     juce::String status = "Reproduza um trecho representativo antes de capturar.";
     juce::String tonalStatus;
 };

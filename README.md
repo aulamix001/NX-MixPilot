@@ -26,6 +26,8 @@ ctest --preset dsp-tests
 
 ## ANALYZE automático
 
+Em **Track**, o editor calibra a pista aberta e oferece controle rotativo de trim. No **HUB**, os medidores do mix bus, o diagnóstico tonal e a tabela mostram as medições da sessão. Use a roda do mouse sobre a tabela para percorrer mais pistas.
+
 No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZE**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
 
 No balanço musical, a pista de **Foco** continua sendo a âncora. A análise tonal permanece visível no espectro para avaliação auditiva. Ela sinaliza sobreposições candidatas e deixa o áudio sem EQ automático.
