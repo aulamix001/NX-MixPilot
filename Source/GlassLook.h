@@ -64,13 +64,20 @@ public:
         ring(start, end, Colour(0xff263c4c), 4);
         ring(start, angle, Colour(0x2838e1ff), 10);
         ring(start, angle, Colour(0xff38dff8), 3);
-        g.setColour(Colour(0xc800050a));
-        g.fillEllipse(face.translated(0, 2).expanded(2));
+        Path shadow;
+        shadow.addEllipse(face);
+        DropShadow(Colour(0xbf000309), 7, {0, 4}).drawForPath(g, shadow);
         g.setGradientFill({Colour(0xff638292), face.getX(), face.getY(), Colour(0xff0e1924),
                            face.getRight(), face.getBottom(), false});
         g.fillEllipse(face);
-        g.setColour(Colour(0xff233648));
-        g.drawEllipse(face.reduced(3), 1);
+        const auto bevel = face.reduced(2.8f);
+        g.setGradientFill({Colour(0xffa1bdcc), bevel.getX(), bevel.getY(), Colour(0xff101925),
+                           bevel.getX(), bevel.getBottom(), false});
+        g.drawEllipse(bevel, 1.4f);
+        const auto cap = face.reduced(6);
+        g.setGradientFill({Colour(0xff364a5a), cap.getX(), cap.getY(), Colour(0xff121b26),
+                           cap.getCentreX(), cap.getBottom(), false});
+        g.fillEllipse(cap);
         Path marker;
         marker.addRoundedRectangle(-1.4f, -radius + 4, 2.8f, radius * 0.35f, 1.4f);
         g.setColour(Colour(0xffedfaff));

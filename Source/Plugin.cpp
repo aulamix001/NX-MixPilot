@@ -357,6 +357,20 @@ public:
             discard(wasAnalyzing ? utf8("Análise cancelada.") : utf8("Prévia cancelada."));
             updateButtons();
         });
+        configureButton(analysisOnly, utf8("Somente análise"), [this]
+        {
+            if (analysisOnly.getToggleState())
+            {
+                analyzing = false;
+                discard(utf8("Somente análise ativa. O áudio mantém os trims aplicados."));
+            }
+            else
+                status = "Ajustes de ganho liberados.";
+            updateButtons();
+            repaint();
+        });
+        analysisOnly.setClickingTogglesState(true);
+        analysisOnly.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff126476));
         bypass.setButtonText("Bypass");
         addAndMakeVisible(bypass);
         bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -395,6 +409,7 @@ public:
         review.setBounds(153, 652, 146, 34);
         audition.setBounds(309, 652, 116, 34);
         cancel.setBounds(435, 652, 99, 34);
+        analysisOnly.setBounds(551, 652, 181, 34);
         undo.setBounds(753, 652, 119, 34);
         apply.setBounds(882, 652, 152, 34);
     }
@@ -423,7 +438,7 @@ public:
         using namespace juce;
         const bool hubMode = plugin.hub();
         g.fillAll(Colour(0xff080e16));
-        ColourGradient ambient(Colour(0xff18364a), 172, 60, Colour(0xff090e17), 798, 643, true);
+        ColourGradient ambient(Colour(0xff203e55), 172, 60, Colour(0xff080b12), 798, 643, true);
         ambient.addColour(0.43, Colour(0xff122333));
         g.setGradientFill(ambient);
         g.fillAll();
@@ -517,14 +532,15 @@ private:
     {
         const juce::Rectangle<float> area(static_cast<float>(x), static_cast<float>(y),
                                            static_cast<float>(w), static_cast<float>(h));
-        g.setColour(juce::Colour(0x74030409));
-        g.fillRoundedRectangle(area.translated(0, 2), 10);
-        g.setGradientFill({juce::Colour(0xba1c2a3a), area.getX(), area.getY(),
-                           juce::Colour(0xe00a121c), area.getRight(), area.getBottom(), false});
-        g.fillRoundedRectangle(area, 10);
+        juce::Path shape;
+        shape.addRoundedRectangle(area, 13);
+        juce::DropShadow(juce::Colour(0x99020409), 6, {0, 3}).drawForPath(g, shape);
+        g.setGradientFill({juce::Colour(0xaa22374c), area.getX(), area.getY(),
+                           juce::Colour(0xdc080e18), area.getRight(), area.getBottom(), false});
+        g.fillPath(shape);
         g.setGradientFill({juce::Colour(0xaf566f87), area.getX(), area.getY(),
                            juce::Colour(0x94314354), area.getX(), area.getBottom(), false});
-        g.drawRoundedRectangle(area.reduced(0.5f), 10, 1);
+        g.drawRoundedRectangle(area.reduced(0.5f), 13, 1);
     }
 
     static void badge(juce::Graphics& g, const juce::String& caption, int x, int y,
@@ -810,12 +826,13 @@ private:
     void updateButtons()
     {
         analyze.setToggleState(analyzing, juce::dontSendNotification);
-        analyze.setEnabled(plugin.value("bypass") < 0.5f);
+        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
+        analyze.setEnabled(writable);
         review.setEnabled(!analyzing);
-        apply.setEnabled(!analyzing && !pending.empty());
-        audition.setEnabled(!analyzing && !pending.empty());
+        apply.setEnabled(writable && !analyzing && !pending.empty());
+        audition.setEnabled(writable && !analyzing && !pending.empty());
         cancel.setEnabled(analyzing || !pending.empty());
-        undo.setEnabled(!analyzing && !plugin.history.empty());
+        undo.setEnabled(writable && !analyzing && !plugin.history.empty());
     }
 
     std::array<float, 6> analysisSettings() const
@@ -826,7 +843,7 @@ private:
 
     void startAnalysis()
     {
-        if (analyzing || plugin.value("bypass") > 0.5f)
+        if (analysisOnly.getToggleState() || analyzing || plugin.value("bypass") > 0.5f)
             return;
         discard(plugin.hub()
             ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
@@ -1045,6 +1062,8 @@ private:
 
     void togglePreview()
     {
+        if (analysisOnly.getToggleState())
+            return;
         std::lock_guard<std::mutex> lock(registry().mutex);
         if (listening)
         {
@@ -1074,6 +1093,8 @@ private:
 
     void commit()
     {
+        if (analysisOnly.getToggleState())
+            return;
         std::lock_guard<std::mutex> lock(registry().mutex);
         if (pending.empty() || !std::all_of(pending.begin(), pending.end(),
                                            [this](const auto& change) { return stillApplies(change); }))
@@ -1093,6 +1114,8 @@ private:
 
     void undoLast()
     {
+        if (analysisOnly.getToggleState())
+            return;
         std::lock_guard<std::mutex> lock(registry().mutex);
         if (plugin.history.empty())
             return;
@@ -1123,7 +1146,7 @@ private:
     GlassLook glass;
     juce::ComboBox instance, role, operation, scope, pick;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
-    juce::TextButton analyze, review, apply, audition, undo, cancel;
+    juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     juce::ToggleButton bypass;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
