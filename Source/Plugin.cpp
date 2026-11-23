@@ -141,11 +141,13 @@ public:
     nx::Role role() const { return static_cast<nx::Role>(static_cast<int>(value("role"))); }
     int group() const { return static_cast<int>(value("group")); }
 
-    void setTrim(float dB)
+    void setTrim(float dB) { setParameter("trim", dB); }
+
+    void setParameter(const char* id, float rawValue)
     {
-        auto* parameter = parameters.getParameter("trim");
+        auto* parameter = parameters.getParameter(id);
         parameter->beginChangeGesture();
-        parameter->setValueNotifyingHost(parameter->convertTo0to1(dB));
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(rawValue));
         parameter->endChangeGesture();
     }
 
@@ -340,6 +342,13 @@ public:
             }
             repaint();
         };
+        for (int i = 0; i < visibleRows; ++i)
+        {
+            auto& button = principalButtons[static_cast<std::size_t>(i)];
+            configureButton(button, "Principal", [this, i] { choosePrincipal(i); });
+            button.setBounds(119, 447 + i * 30, 58, 24);
+            button.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff126476));
+        }
         configureButton(analyze, "ANALYZER", [this] { startAnalysis(); });
         analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
         analyze.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
@@ -420,6 +429,7 @@ public:
             return;
         firstRow = juce::jlimit(0, std::max(0, static_cast<int>(rows.size()) - visibleRows),
                                firstRow + (wheel.deltaY > 0 ? -1 : wheel.deltaY < 0 ? 1 : 0));
+        updatePrincipalButtons();
         repaint();
     }
 
@@ -738,10 +748,10 @@ private:
             }
             const int top = static_cast<int>(y);
             label(g, trackName(row.identity) + " / G" + juce::String(row.group), 31, top, 99, 28, 13, ink);
-            if (row.role == nx::focus)
+            if (!plugin.hub() && row.role == nx::focus)
                 badge(g, "Foco", 124, top + 3, 43, cyan);
             const bool signal = row.current && row.reading.peak > -90;
-            drawSegments(g, {174, y + 9, 60, 10}, signal ? row.reading.rms : nx::floorDb, 10, false);
+            drawSegments(g, {183, y + 9, 51, 10}, signal ? row.reading.rms : nx::floorDb, 10, false);
             const auto dash = utf8("—");
             label(g, signal ? number(row.reading.rms) : dash, 248, top, 75, 28, 13);
             label(g, signal ? number(row.reading.peak) : dash, 327, top, 75, 28, 13);
@@ -817,10 +827,53 @@ private:
             append(plugin);
         }
         updateSuggestions();
+        updatePrincipalButtons();
 
         finishAnalysis();
         updateButtons();
         repaint();
+    }
+
+    void updatePrincipalButtons()
+    {
+        for (int i = 0; i < visibleRows; ++i)
+        {
+            auto& button = principalButtons[static_cast<std::size_t>(i)];
+            const auto index = static_cast<std::size_t>(firstRow + i);
+            const bool present = plugin.hub() && index < rows.size();
+            button.setVisible(present);
+            if (present)
+            {
+                const auto& row = rows[index];
+                button.setTitle("Marcar " + trackName(row.identity) + " como Principal");
+                button.setToggleState(row.role == nx::focus, juce::dontSendNotification);
+            }
+        }
+    }
+
+    void choosePrincipal(int visibleIndex)
+    {
+        const auto index = static_cast<std::size_t>(firstRow + visibleIndex);
+        if (!plugin.hub() || index >= rows.size())
+            return;
+        const auto identity = rows[index].identity;
+        const int sessionId = plugin.session();
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            auto* selected = findTrack(identity);
+            if (selected == nullptr || selected->hub() || selected->session() != sessionId)
+                return;
+
+            for (auto* track : registry().tracks)
+                if (track != nullptr && track != selected && !track->hub()
+                    && track->session() == sessionId && track->role() == nx::focus)
+                    track->setParameter("role", nx::automatic);
+            selected->setParameter("role", nx::focus);
+            plugin.setParameter("operation", 1);
+        }
+        analyzing = false;
+        discard(trackName(identity) + utf8(" é a Principal. Reproduza o trecho e clique em ANALYZER."));
+        timerCallback();
     }
 
     void updateButtons()
@@ -1147,6 +1200,7 @@ private:
     juce::ComboBox instance, role, operation, scope, pick;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
+    std::array<juce::TextButton, visibleRows> principalButtons;
     juce::ToggleButton bypass;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;

@@ -30,6 +30,8 @@ Em **Track**, o editor calibra a pista aberta e oferece controle rotativo de tri
 
 No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZER**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
 
+Clique em **Principal** na linha da pista de referência no HUB para selecioná-la e ativar o **Balanço musical**. Depois, com as pistas em reprodução, clique em **ANALYZER**.
+
 No balanço musical, a pista de **Foco** continua sendo a âncora. A análise tonal permanece visível no espectro para avaliação auditiva. Ela sinaliza sobreposições candidatas e deixa o áudio sem EQ automático.
 
 ## Calibração técnica
