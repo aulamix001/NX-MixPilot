@@ -24,11 +24,11 @@ cmake --build --preset dsp-tests
 ctest --preset dsp-tests
 ```
 
-## ANALYZE automático
+## ANALYZER automático
 
 Em **Track**, o editor calibra a pista aberta e oferece controle rotativo de trim. No **HUB**, os medidores do mix bus, o diagnóstico tonal e a tabela mostram as medições da sessão. Use a roda do mouse sobre a tabela para percorrer mais pistas.
 
-No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZE**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
+No HUB, selecione a sessão e o modo **Calibração técnica** ou **Balanço musical**. Reproduza um trecho representativo e clique em **ANALYZER**. O botão fica verde durante a análise. Após cerca de 1,2 segundo, ele aplica um trim individual a cada Track ativo da sessão com medição atual e margem suficiente. O seletor de escopo continua valendo para **Capturar prévia**. Use **Cancelar** durante a análise ou **Desfazer** depois da aplicação.
 
 No balanço musical, a pista de **Foco** continua sendo a âncora. A análise tonal permanece visível no espectro para avaliação auditiva. Ela sinaliza sobreposições candidatas e deixa o áudio sem EQ automático.
 
@@ -43,5 +43,5 @@ No balanço musical, a pista de **Foco** continua sendo a âncora. A análise to
 ## Balanço musical e análise tonal
 
 - Para testar o **Balanço musical**, marque uma pista ativa como **Foco**. O nível atual do foco é a âncora. Os outros níveis são sugeridos por categoria e limitados pela margem. O modo **Auto** identifica predominância de graves a partir da energia espectral. A escolha do foco e a classificação das demais funções musicais continuam editáveis no Track. O protótipo ainda não identifica instrumentos, gênero ou intenção de mixagem automaticamente.
-- O espectro usa FFT Hann de 2.048 amostras e energia por banda. O HUB destaca sobreposição instantânea quando duas medições têm a mesma janela informada pelo host. Isso ajuda a localizar candidatos para comparação. A confirmação de mascaramento recorrente, a estimativa de confiança e a aplicação de EQ dinâmica ficam para validação com sessões e material musical reais. A sobreposição exibida não altera o áudio.
+- O espectro usa FFT Hann de 2.048 amostras e energia por banda. A curva suavizada aparece quando há sinal medido e some no silêncio. O HUB destaca sobreposição instantânea quando duas medições têm a mesma janela informada pelo host. Isso ajuda a localizar candidatos para comparação. A confirmação de mascaramento recorrente, a estimativa de confiança e a aplicação de EQ dinâmica ficam para validação com sessões e material musical reais. A sobreposição exibida não altera o áudio.
 - A comunicação é em memória, com até 64 instâncias por módulo, incluindo os HUBs. Hosts que isolam cada plugin em processos distintos impedem a troca de medições. A interface de cada Track ainda mede e aplica seu trim local. Valide no Studio One com dois Tracks na mesma sessão e um HUB no master. Verifique descoberta, ganho individual e comum, Undo, sessão reaberta e sobreposição durante a reprodução. A implementação atua no trim interno do plugin. Os faders da DAW ficam sob controle do host.

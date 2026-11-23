@@ -63,4 +63,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" NX-MixPilot-VST3-Windows-x64.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "NX Audio MixPilot $GITHUB_REF_NAME" \
-            --notes "VST3 Windows x64 com ANALYZE verde e ajuste individual de ganho. Extraia a pasta completa NX Audio MixPilot.vst3 para a pasta VST3 do Windows. O carregamento no Studio One 8 ainda precisa ser validado."
+            --notes "VST3 Windows x64 com ANALYZER verde e ajuste individual de ganho. Extraia a pasta completa NX Audio MixPilot.vst3 para a pasta VST3 do Windows. O carregamento no Studio One 8 ainda precisa ser validado."

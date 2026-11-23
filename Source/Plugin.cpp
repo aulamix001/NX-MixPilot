@@ -340,7 +340,7 @@ public:
             }
             repaint();
         };
-        configureButton(analyze, "ANALYZE", [this] { startAnalysis(); });
+        configureButton(analyze, "ANALYZER", [this] { startAnalysis(); });
         analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
         analyze.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
         analyze.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
@@ -616,23 +616,40 @@ private:
             g.drawHorizontalLine(y, plot.getX(), plot.getRight());
             label(g, juce::String(-20 * i), 27, y - 8, 29, 16, 11);
         }
+        const auto hasSpectrum = [](const nx::Reading& reading)
+        {
+            return std::any_of(reading.power.begin(), reading.power.end(),
+                               [](float power) { return power > 1.0e-8f; });
+        };
         const auto trace = [&](const nx::Reading& reading, juce::uint32 tint)
         {
-            juce::Path curve;
-            float firstX = plot.getX(), lastX = firstX;
+            std::array<float, nx::bands> y {}, slope {};
+            const float pitch = plot.getWidth() / nx::bands;
+            const float firstX = plot.getX() + pitch * 0.5f;
+            const float lastX = firstX + pitch * (nx::bands - 1);
             for (int i = 0; i < nx::bands; ++i)
             {
-                const auto decibels = nx::db(std::sqrt(reading.power[i]));
-                const auto x = plot.getX() + plot.getWidth() * (i + 0.5f) / nx::bands;
-                const auto y = plot.getY() + plot.getHeight() * std::clamp(-decibels / 80.0f, 0.0f, 1.0f);
-                if (i == 0)
-                {
-                    firstX = x;
-                    curve.startNewSubPath(x, y);
-                }
-                else
-                    curve.lineTo(x, y);
-                lastX = x;
+                const auto left = reading.power[std::max(0, i - 1)];
+                const auto right = reading.power[std::min(nx::bands - 1, i + 1)];
+                const auto power = 0.80f * reading.power[i] + 0.10f * (left + right);
+                const auto decibels = nx::db(std::sqrt(power));
+                y[i] = plot.getY() + plot.getHeight() * std::clamp(-decibels / 80.0f, 0.0f, 1.0f);
+            }
+            for (int i = 1; i < nx::bands - 1; ++i)
+            {
+                const auto left = y[i] - y[i - 1], right = y[i + 1] - y[i];
+                // A bounded slope keeps each segment within its two measured endpoints.
+                if (left * right > 0)
+                    slope[i] = (2 * left * right) / (left + right);
+            }
+            juce::Path curve;
+            curve.startNewSubPath(firstX, y.front());
+            for (int i = 0; i < nx::bands - 1; ++i)
+            {
+                const auto x = firstX + i * pitch;
+                curve.cubicTo(x + pitch / 3.0f, y[i] + slope[i] / 3.0f,
+                              x + 2.0f * pitch / 3.0f, y[i + 1] - slope[i + 1] / 3.0f,
+                              x + pitch, y[i + 1]);
             }
             const juce::Colour color(tint);
             auto fill = curve;
@@ -647,24 +664,28 @@ private:
             g.setColour(color);
             g.strokePath(curve, juce::PathStrokeType(1.65f));
         };
-        if (otherRow >= 0)
+        bool drewTrace = false;
+        if (otherRow >= 0 && hasSpectrum(rows[static_cast<std::size_t>(otherRow)].reading))
         {
             const auto& other = rows[static_cast<std::size_t>(otherRow)];
             trace(other.reading, amber);
+            drewTrace = true;
             label(g, trackName(other.identity), 566, 161, 108, 24, 12, amber);
         }
-        if (focusRow >= 0)
+        if (focusRow >= 0 && hasSpectrum(rows[static_cast<std::size_t>(focusRow)].reading))
         {
             const auto& focus = rows[static_cast<std::size_t>(focusRow)];
             trace(focus.reading, cyan);
+            drewTrace = true;
             label(g, trackName(focus.identity) + " (Foco)", 421, 161, 135, 24, 12, cyan);
         }
-        else if (localSignal())
+        else if (localCurrent && hasSpectrum(local))
         {
             trace(local, cyan);
+            drewTrace = true;
             label(g, plugin.hub() ? "Mix bus" : "Entrada", 565, 161, 105, 24, 12, cyan);
         }
-        else
+        if (!drewTrace)
             label(g, "Aguardando sinal", 309, 257, 168, 20, 14, ink);
 
         constexpr std::array<float, 7> ticks {20, 60, 200, 600, 2000, 6000, 20000};
@@ -808,8 +829,8 @@ private:
         if (analyzing || plugin.value("bypass") > 0.5f)
             return;
         discard(plugin.hub()
-            ? utf8("ANALYZE  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
-            : utf8("ANALYZE  /  Mantenha a pista em reprodução. O trim local será ajustado."));
+            ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
+            : utf8("ANALYZER  /  Mantenha a pista em reprodução. O trim local será ajustado."));
         requestedSettings = analysisSettings();
         analysisStarted = juce::Time::getMillisecondCounter();
         analyzing = true;
@@ -824,7 +845,7 @@ private:
         if (plugin.value("bypass") > 0.5f || requestedSettings != analysisSettings())
         {
             analyzing = false;
-            status = utf8("ANALYZE cancelado após alteração das configurações.");
+            status = utf8("ANALYZER cancelado após alteração das configurações.");
             return;
         }
         if (juce::Time::getMillisecondCounter() - analysisStarted < 1200)
@@ -979,7 +1000,7 @@ private:
         if (automatic)
         {
             status = pending.empty()
-                ? utf8("ANALYZE concluído sem ajustes. Confira o sinal, a referência e a margem de pico.")
+                ? utf8("ANALYZER concluído sem ajustes. Confira o sinal, a referência e a margem de pico.")
                 : juce::String{};
             return;
         }
