@@ -222,6 +222,14 @@ public:
             registry().tracks[static_cast<std::size_t>(slot)] = nullptr;
     }
 
+    static juce::StringArray gainStyleNames()
+    {
+        juce::StringArray names;
+        for (const auto& style : nx::gainStyles)
+            names.add(style.name);
+        return names;
+    }
+
     static juce::StringArray peakNames()
     {
         return {utf8("Sem referência de pico"), "Kick", "Snare", utf8("Hi-hat / Percussão"), "Baixo",
@@ -248,6 +256,8 @@ public:
                         NormalisableRange<float>{-24, 24, 0.01f}, 0));
         result.add(std::make_unique<AudioParameterChoice>(ParameterID{"operation", 1}, utf8("Operação"),
                         StringArray{utf8("Calibração técnica"), utf8("Balanço musical")}, 0));
+        result.add(std::make_unique<AudioParameterChoice>(ParameterID{"gainStyle", 1}, "Estilo de ganho",
+                        gainStyleNames(), 0));
         result.add(std::make_unique<AudioParameterFloat>(ParameterID{"reference", 1}, "0 VU (dBFS RMS)",
                         NormalisableRange<float>{-36, -6, 0.1f}, nx::nominalRms));
         result.add(std::make_unique<AudioParameterFloat>(ParameterID{"limit", 1}, "Limite de ajuste (dB)",
@@ -721,6 +731,9 @@ public:
         attachChoice(peakReference, "peakReference", Processor::peakNames());
         attachChoice(support, "support", Processor::supportNames());
         attachChoice(operation, "operation", {utf8("Calibração técnica"), utf8("Balanço musical")});
+        attachChoice(gainStyle, "gainStyle", Processor::gainStyleNames());
+        gainStyle.setTitle("Estilo de ganho");
+        gainStyle.setTooltip(utf8("Perfil de balanço e alvos de preset. Os tetos de pico e true peak continuam valendo."));
         attachSlider(session, "session", "");
         attachSlider(group, "group", "");
         attachSlider(trim, "trim", " dB");
@@ -1013,6 +1026,7 @@ public:
         tonalToggle.setBounds(865, 114, 162, 27);
         advancedToggle.setBounds(670, 16, 104, 30);
         smartToggle.setBounds(813, 75, 215, 27);
+        gainStyle.setBounds(plugin.hub() ? 594 : 685, plugin.hub() ? 114 : 75, 121, 27);
         smartPanel.setBounds(703, advanced ? 404 : 255, 336, 447);
         tonalExclude.setBounds(724, 114, 135, 27);
         tonalPanel.setBounds(703, advanced ? 404 : 255, 336, 447);
@@ -1116,11 +1130,13 @@ public:
             label(g, mode() == nx::GainMode::calibration ? "0 VU RMS" : utf8("Âncora: pista de Foco"), 400, 75, 190, 27, 13);
             label(g, "Headroom", 600, 75, 68, 27, 13);
             label(g, utf8("Escopo da prévia"), 362, 114, 160, 26, 13);
+            label(g, "Estilo", 550, 114, 43, 26, 13);
             if (scope.getSelectedId() == 2)
                 label(g, "Grupo", 172, 114, 48, 26, 13);
         }
         else
         {
+            label(g, "Estilo", 641, 75, 43, 26, 13);
             label(g, "Papel", 216, 75, 50, 27, 13);
             label(g, "Grupo", 409, 75, 50, 27, 13);
             label(g, "0 VU RMS", 22, 113, 70, 27, 13);
@@ -2092,6 +2108,7 @@ private:
             auto& batch = plugin.redoHistory.back();
             std::vector<Change> applied;
             capturedSession = plugin.session();
+            capturedGainStyle = plugin.value("gainStyle");
             capturedHeadroom = plugin.value("headroom");
             batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const auto& item)
             {
@@ -2597,12 +2614,14 @@ private:
 
     void timerCallback() override
     {
-        if ((plugin.hub() != capturedHub || plugin.session() != capturedSession || plugin.value("bypass") > 0.5f)
+        if ((plugin.hub() != capturedHub || plugin.session() != capturedSession || plugin.value("bypass") > 0.5f
+            || plugin.value("gainStyle") != capturedGainStyle)
             && !pending.empty())
-            discard(utf8("Prévia cancelada após alteração de sessão, instância ou bypass."));
+            discard(utf8("Prévia cancelada após alteração de sessão, estilo, instância ou bypass."));
 
         const bool isHub = plugin.hub();
         operation.setVisible(isHub);
+        gainStyle.setBounds(isHub ? 594 : 685, isHub ? 114 : 75, 121, 27);
         if (instruments.getSelectedId() != static_cast<int>(plugin.value("instrument")) + 1)
             populateInstruments();
         scope.setVisible(isHub);
@@ -2783,11 +2802,11 @@ private:
         undo.setEnabled(writable && !analyzing && !plugin.history.empty());
     }
 
-    std::array<float, 10> analysisSettings() const
+    std::array<float, 11> analysisSettings() const
     {
         return {plugin.value("instance"), plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
                 plugin.value("limit"), plugin.value("headroom"), plugin.value("learnTime"),
-                plugin.value("sensitivity"), plugin.value("trueCeiling"), plugin.value("smartStrategy")};
+                plugin.value("sensitivity"), plugin.value("trueCeiling"), plugin.value("smartStrategy"), plugin.value("gainStyle")};
     }
 
     void startAnalysis(bool previewOnly = false)
@@ -2935,13 +2954,46 @@ private:
             }
     }
 
+    static nx::StyleLane styleLane(const TrackRow& row)
+    {
+        if (row.instrument > 0)
+        {
+            const auto& preset = nx::presets[row.instrument - 1];
+            const std::string_view name(preset.name);
+            if (name.find("Backing") == 0 || name.find("Coro") == 0 || name.find("Coral") == 0
+                || name.find("Harmonia vocal") == 0 || name.find("Dobra vocal") == 0)
+                return nx::StyleLane::backing;
+            if (name.find("Pad ") == 0 || name.find("FX ") == 0 || name.find("SFX ") == 0)
+                return nx::StyleLane::ambience;
+            switch (preset.category)
+            {
+                case 0: return nx::StyleLane::drums;
+                case 1: return nx::StyleLane::bass;
+                case 2:
+                case 3:
+                case 4:
+                case 5: return nx::StyleLane::harmony;
+                default: break;
+            }
+        }
+        if (row.function == nx::Function::harmony)
+            return nx::StyleLane::harmony;
+        if (row.function == nx::Function::rhythm)
+            return nx::StyleLane::drums;
+        if (row.function == nx::Function::ambience)
+            return nx::StyleLane::ambience;
+        return nx::StyleLane::other;
+    }
+
     nx::SmartGainResult diagnoseGain(const TrackRow& row, float anchor, bool learned) const
     {
         auto reading = row.reading;
         const auto maxSample = std::max(reading.peak, learned ? reading.learnedMaxSample : nx::floorDb);
         if (learned && reading.learnedPeak > nx::floorDb)
             reading.peak = reading.learnedPeak;
-        if (strategy() == nx::GainStrategy::hybrid)
+        if (strategy() == nx::GainStrategy::musical)
+            reading.rms = nx::musicalRms(reading, row.role == nx::focus, learned, row.outputGainDb);
+        else if (strategy() == nx::GainStrategy::hybrid)
         {
             if (learned && reading.learnedActiveWindows >= 4 && reading.learnedEnergy > nx::floorDb)
                 reading.rms = 0.5f * (reading.rms + reading.learnedEnergy);
@@ -2960,7 +3012,9 @@ private:
                 && rows[static_cast<std::size_t>(focusRow)].identity == row.identity ? nx::focus : row.role;
         return nx::smartGain({reading, strategy(), chosenRole, row.function, categoryId, row.priority,
                               row.peakProfile, row.trim, target, anchor, plugin.value("limit"), headroomDb, maximum,
-                              row.instrumentCeiling, maxSample, row.outputGainDb + row.toneBoost});
+                              row.instrumentCeiling, maxSample, row.outputGainDb + row.toneBoost,
+                              static_cast<nx::GainStyle>(static_cast<int>(plugin.value("gainStyle"))),
+                              styleLane(row), row.customPeak > 0 && row.peakProfile == 0 && row.instrument > 0});
     }
 
     void capture()
@@ -3001,6 +3055,7 @@ private:
         int skipped = 0;
         capturedSession = plugin.session();
         capturedHub = plugin.hub();
+        capturedGainStyle = plugin.value("gainStyle");
         capturedHeadroom = plugin.value("headroom");
         const int scopeId = automatic || !capturedHub ? 3 : scope.getSelectedId();
         auto inScope = [&](const auto& row)
@@ -3071,6 +3126,8 @@ private:
 
     bool stillApplies(const Change& change) const
     {
+        if (plugin.value("gainStyle") != capturedGainStyle)
+            return false;
         auto* track = findTrack(change.identity);
         if (track == nullptr || !track->eligible(capturedSession) || !track->volumeUnlocked()
             || std::abs(track->value("trim") - change.previous) > 0.011f
@@ -3233,7 +3290,7 @@ private:
     double graphStart = 0, graphSpan = 96;
     int averageMs = 300;
     juce::Point<float> graphCursor {-1, -1};
-    juce::ComboBox instance, role, operation, scope, pick, support, peakReference, category, instruments;
+    juce::ComboBox instance, role, operation, gainStyle, scope, pick, support, peakReference, category, instruments;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
@@ -3247,11 +3304,11 @@ private:
     std::vector<Change> pending;
     nx::Reading local;
     bool localCurrent = false, listening = false, analyzing = false;
-    std::array<float, 10> requestedSettings {};
+    std::array<float, 11> requestedSettings {};
     juce::uint32 analysisStarted = 0;
     unsigned activeLearning = 0;
     int focusRow = -1, otherRow = -1, capturedSession = 0;
-    float capturedHeadroom = 0;
+    float capturedHeadroom = 0, capturedGainStyle = 0;
     bool capturedHub = false;
     juce::String status = "Reproduza um trecho representativo antes de capturar.";
     juce::String tonalStatus;

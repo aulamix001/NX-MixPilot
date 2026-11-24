@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Analysis.h"
+#include "GainStyles.h"
 
 namespace nx
 {
@@ -31,6 +32,9 @@ struct SmartGainInput
     int category = 2, priority = 50, legacyPeakProfile = 0;
     float trim = 0, target = 1, anchor = nominalRms, limit = 6, margin = 3, ceiling = floorDb;
     float instrumentCeiling = 1, maxSample = floorDb, downstreamGain = 0;
+    GainStyle style = GainStyle::universal;
+    StyleLane styleLane = StyleLane::other;
+    bool stylePresetTarget = false;
 };
 
 struct SmartGainResult
@@ -68,13 +72,28 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
             role = music;
     }
 
+    auto lane = input.styleLane;
+    if (role == bass)
+        lane = StyleLane::bass;
+    else if (role == drums || role == auxiliaryPercussion)
+        lane = StyleLane::drums;
+    else if (role == harmony)
+        lane = StyleLane::harmony;
+    else if (role == backingVocal)
+        lane = StyleLane::backing;
+    else if (role == ambience)
+        lane = StyleLane::ambience;
+    const float offset = anchorRole ? 0.0f : gainStyleOffset(input.style, lane);
+    const float technicalTarget = input.stylePresetTarget && input.target <= 0
+        ? input.target + offset * 0.5f : input.target;
+
     const auto peakShape = soundShape(input.category, result.crest);
     float desired = input.trim;
     switch (input.strategy)
     {
         case GainStrategy::technical:
             desired = suggestTrim(signal, GainMode::calibration, input.anchor, role, 90, -90,
-                                  input.legacyPeakProfile, input.target).trim;
+                                  input.legacyPeakProfile, technicalTarget).trim;
             if (std::abs(desired - input.trim) <= tolerance(peakShape))
                 desired = input.trim;
             break;
@@ -84,20 +103,20 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
             // that will carry into the louder sections of the song.
             if (!anchorRole)
             {
-                const auto musical = suggestTrim(signal, GainMode::musical, input.anchor, role, 90, -90,
+                const auto musical = suggestTrim(signal, GainMode::musical, input.anchor + offset, role, 90, -90,
                                                  input.legacyPeakProfile, input.target).trim;
                 desired = std::min({musical, input.trim, 0.0f});
             }
             break;
         case GainStrategy::hybrid:
         {
-            const auto musical = suggestTrim(signal, GainMode::musical, input.anchor, role, 90, -90,
+            const auto musical = suggestTrim(signal, GainMode::musical, input.anchor + offset, role, 90, -90,
                                              input.legacyPeakProfile, input.target).trim;
             desired = musical;
             if (!anchorRole)
             {
                 const auto technical = suggestTrim(signal, GainMode::calibration, nominalRms, role, 90, -90,
-                                                    input.legacyPeakProfile, input.target).trim;
+                                                    input.legacyPeakProfile, technicalTarget).trim;
                 const float qualifier = peakShape == SoundShape::transient ? 0.25f : 0.65f;
                 const float absoluteCandidate = technical + qualifier * (musical - technical);
                 const float musicalWeight = static_cast<float>(std::clamp(input.priority, 0, 100)) / 100.0f;

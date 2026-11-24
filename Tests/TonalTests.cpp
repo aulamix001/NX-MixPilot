@@ -176,6 +176,42 @@ int main()
             nx::instrumentPresetCeiling({"Guitarra clean", 3, -14}) == -10,
             "Instrument ceilings must use the project's starter ranges.");
 
+    nx::SmartGainInput styled;
+    styled.signal.rms = -20;
+    styled.signal.peak = -14;
+    styled.signal.settled = true;
+    styled.anchor = -20;
+    styled.limit = 12;
+    styled.strategy = nx::GainStrategy::musical;
+    styled.role = nx::music;
+    styled.styleLane = nx::StyleLane::harmony;
+    require(near(nx::smartGain(styled).suggestion.trim, -5, 0.001), "Universal must retain the established guitar balance.");
+    styled.style = nx::GainStyle::worship;
+    require(near(nx::smartGain(styled).suggestion.trim, -6.5f, 0.001), "Worship should reserve more space for the focus.");
+    styled.style = nx::GainStyle::popRock;
+    require(near(nx::smartGain(styled).suggestion.trim, -4.25f, 0.001), "Pop Rock should retain more harmonic level.");
+    styled.role = nx::focus;
+    styled.trim = -2;
+    require(nx::smartGain(styled).suggestion.trim == -2, "Genre presets must preserve a safe focus trim.");
+    styled.role = nx::music;
+    styled.trim = 0;
+    styled.strategy = nx::GainStrategy::technical;
+    styled.signal.peak = -24;
+    styled.target = -14;
+    styled.stylePresetTarget = true;
+    styled.style = nx::GainStyle::worship;
+    require(near(nx::smartGain(styled).suggestion.trim, 9.25f, 0.001), "Style should mildly steer a factory peak target.");
+    styled.stylePresetTarget = false;
+    require(near(nx::smartGain(styled).suggestion.trim, 10, 0.001), "Style must never rewrite a manual peak target.");
+    styled.instrumentCeiling = -13;
+    styled.maxSample = -8;
+    require(near(nx::smartGain(styled).suggestion.trim, -5, 0.001), "Genre style must never weaken the measured peak ceiling.");
+    styled.strategy = nx::GainStrategy::preserve;
+    styled.instrumentCeiling = 1;
+    styled.style = nx::GainStyle::gospel;
+    styled.trim = -1;
+    require(nx::smartGain(styled).suggestion.trim == -1, "Preserve Mix must not rebalance the user mix by style.");
+
     const auto bus = nx::planGlobalHeadroom(-2, -1.4f, -6, -1, 1);
     require(bus.available && near(bus.suggested, -3, 0.01), "Global headroom must use the measured bus.");
     require(nx::planGlobalHeadroom(-20, -19, -6, -1, 0).suggested == 0, "Headroom manager must not raise a quiet mix.");

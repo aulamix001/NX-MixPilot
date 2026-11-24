@@ -193,6 +193,38 @@ int main()
     require(read(*second, "trim") <= -3.9f,
             "Musical Auto Gain must use the learned loud passage and guitar ceiling even when the final window is quiet.");
 
+    auto* styles = dynamic_cast<juce::ComboBox*>(findControl(*editor, "Estilo de ganho"));
+    require(styles && styles->getNumItems() == 6 && styles->getText() == "Universal", "Six styles must be accessible in the compact HUB.");
+    styles->setSelectedId(2, juce::sendNotificationSync);
+    require(read(*hub, "gainStyle") == 1, "Selecting Worship must reach the persisted gain parameter.");
+    juce::MemoryBlock hubState;
+    hub->getStateInformation(hubState);
+    {
+        Plugin restoredHub(createPluginFilter());
+        restoredHub->setStateInformation(hubState.getData(), static_cast<int>(hubState.getSize()));
+        require(read(*restoredHub, "gainStyle") == 1, "The style must survive session save and restore.");
+    }
+
+    write(*first, "trim", 0);
+    write(*second, "trim", 0);
+    write(*hub, "limit", 12);
+    click(*editor, "AUTO GAIN");
+    for (int frame = 0; frame < 34; ++frame)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            feed(*first, playhead, signal, midi, 996.09375, 0.12, false);
+            feed(*second, playhead, signal, midi, 996.09375, frame < 17 ? 0.12 : 0.011, true);
+            feed(*hub, playhead, signal, midi, 1253.90625, 0.18, false);
+            playhead.position += block;
+        }
+        juce::Thread::sleep(47);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    require(std::abs(read(*first, "trim")) < 0.02f, "A new style must not boost or attenuate a safe focus.");
+    require(std::abs(read(*second, "trim") + 6.5f) < 0.2f,
+            "Worship Auto Gain must use the louder accompaniment RMS windows even when its peak ceiling is not active.");
+
     const auto file = juce::File::createTempFile(".wav");
     {
         juce::WavAudioFormat format;
