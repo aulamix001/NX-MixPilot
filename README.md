@@ -75,6 +75,8 @@ Os valores da tabela são escolhas de mixagem. A recomendação [ITU-R BS.1770](
 
 ## Gain staging universal
 
+Na tela Track, **Nivelar RMS** mede a energia dos trechos ativos e aplica um trim estático usando o alvo de **0 VU**. A margem, o teto do instrumento, o true peak medido e o limite de trim continuam protegendo a saída. **AUTO GAIN** mantém a calibração por pico quando há uma referência de instrumento. **Ouvir original** compara a entrada com a saída ajustada deste insert sem alterar o trim salvo. A faixa **Saída do insert** mostra também a diferença RMS medida. Para ouvir apenas a diferença do MixPilot no Studio One, compare com os inserts posteriores temporariamente desativados.
+
 Em **Avançado**, os medidores **LUFS** exibem separadamente entrada e saída. **M** usa 400 ms, **S** usa 3 s e **I** acumula a medição desde a abertura da sessão de áudio ou o último **RESET**. O meter usa ponderação K e gates absoluto e relativo. O gate integrado usa faixas de 0,1 LU. As leituras são informativas e o Auto Gain continua usando as referências de pico ou RMS do modo escolhido. **RESET** limpa o histórico de loudness e o peak hold da instância.
 
 **Ganho contínuo**, em **Avançado**, acompanha o RMS depois do trim, do EQ e do ganho de saída. Use **0 VU (RMS)** como referência e o **Limite de trim** como orçamento da correção contínua. O ganho sobe devagar, recua mais rápido, considera a margem de pico e mantém a última correção durante pausas. **FREEZE** segura a correção. O HUB exclui do Auto Gain estático as pistas com ganho contínuo ativo.

@@ -88,6 +88,7 @@ struct Measurement
         learnedCeiling.store(reading.learnedCeiling);
         learnedActiveWindows.store(reading.learnedActiveWindows);
         learnedEnergy.store(reading.learnedEnergy);
+        learnedRms.store(reading.learnedRms);
         learnedLoudEnergy.store(reading.learnedLoudEnergy);
         sampleRate.store(reading.sampleRate);
         settled.store(reading.settled);
@@ -119,6 +120,7 @@ struct Measurement
         reading.learnedCeiling = learnedCeiling.load();
         reading.learnedActiveWindows = learnedActiveWindows.load();
         reading.learnedEnergy = learnedEnergy.load();
+        reading.learnedRms = learnedRms.load();
         reading.learnedLoudEnergy = learnedLoudEnergy.load();
         reading.sampleRate = sampleRate.load();
         reading.settled = settled.load();
@@ -139,6 +141,7 @@ struct Measurement
     std::atomic<unsigned> version {0}, learningId {0};
     std::atomic<float> learnedPeak {nx::floorDb}, learnedCeiling {nx::floorDb}, learnedEnergy {nx::floorDb}, learnedLoudEnergy {nx::floorDb}, learnedMaxSample {nx::floorDb};
     std::atomic<unsigned> learnedActiveWindows {0};
+    std::atomic<float> learnedRms {nx::floorDb};
     std::atomic<float> activeRms {nx::floorDb}, activity {0};
     std::atomic<float> rms {nx::floorDb}, peak {nx::floorDb}, outputPeak {nx::floorDb};
     std::atomic<bool> settled {false};
@@ -198,7 +201,7 @@ struct Change
     unsigned identity;
     float previous, next;
     std::optional<float> previousApplied;
-    unsigned peakCaptureId = 0;
+    unsigned captureId = 0;
 };
 
 class Processor;
@@ -519,6 +522,8 @@ public:
         continuous.prepare(rate);
         gain.reset(rate, 0.035);
         outputGain.reset(rate, 0.035);
+        originalBlend.reset(rate, 0.025);
+        originalBlend.setCurrentAndTargetValue(0);
         outputGain.setCurrentAndTargetValue(1);
         gain.setCurrentAndTargetValue(1);
         settings = -1;
@@ -542,6 +547,8 @@ public:
             learningId = request;
             learningHistogram.fill(0);
             energyHistogram.fill(0);
+            capturedEnergy = 0;
+            capturedActivity = 0;
             learnedCeiling = learnedSampleMax = nx::floorDb;
         }
         if (holdReset.exchange(false))
@@ -568,6 +575,7 @@ public:
         const auto audition = !adaptiveGain && previewSession.load() == sessionId && volumeUnlocked()
             ? preview.load() : noPreview;
         const bool bypass = value("bypass") >= 0.5f;
+        originalBlend.setTargetValue(!isHub && auditionOriginal.load() ? 1.0 : 0.0);
         continuous.configure(!bypass && adaptiveGain, value("freeze") > 0.5f, value("reference"),
                              value("limit"), value("headroom"), !bypass && value("safetyLimiter") > 0.5f
                              && value("referenceOnly") < 0.5f, value("limiterCeiling"));
@@ -610,6 +618,17 @@ public:
             auto processedLeft = clean(equalizedLeft * applied);
             auto processedRight = clean(equalizedRight * applied);
             continuous.process(processedLeft, processedRight);
+            const auto dryMix = originalBlend.getNextValue();
+            if (dryMix >= 1)
+            {
+                processedLeft = dryLeft;
+                processedRight = dryRight;
+            }
+            else if (dryMix > 0)
+            {
+                processedLeft += dryMix * (dryLeft - processedLeft);
+                processedRight += dryMix * (dryRight - processedRight);
+            }
             const auto wetLeft = clean(bypass ? dryLeft : static_cast<Sample>(processedLeft));
             const auto wetRight = clean(bypass ? dryRight : static_cast<Sample>(processedRight));
             left[sample] = wetLeft;
@@ -639,12 +658,18 @@ public:
                     if (measured > -60)
                         ++learningHistogram[static_cast<std::size_t>(std::clamp(static_cast<int>(std::ceil(measured)) + 60, 0, 84))];
                     if (reading.activity >= 0.08f && reading.activeRms > -55.0f)
+                    {
                         ++energyHistogram[static_cast<std::size_t>(std::clamp(static_cast<int>(std::ceil(reading.activeRms)) + 60, 0, 84))];
+                        capturedEnergy += std::pow(10.0, reading.activeRms / 10.0) * reading.activity;
+                        capturedActivity += reading.activity;
+                    }
                     learnedSampleMax = std::max(learnedSampleMax, measured);
                     learnedCeiling = std::max(learnedCeiling, truePeak);
                     reading.learningId = learningId;
                     reading.learnedCeiling = learnedCeiling;
                     reading.learnedMaxSample = learnedSampleMax;
+                    if (capturedActivity > 0)
+                        reading.learnedRms = nx::db(static_cast<float>(std::sqrt(capturedEnergy / capturedActivity)));
                     unsigned total = 0;
                     for (auto count : learningHistogram)
                         total += count;
@@ -696,6 +721,7 @@ public:
     std::atomic<float> learningSensitivity {1};
     std::atomic<float> continuousDb {0}, limitationDb {0};
     std::atomic<bool> holdReset {false};
+    std::atomic<bool> auditionOriginal {false};
     std::atomic<float> preview {noPreview};
     std::atomic<int> previewSession {0};
     unsigned identity = 0;
@@ -714,8 +740,10 @@ private:
     nx::ContinuousGain continuous;
     nx::LoudnessMeter inputLoudness, outputLoudness;
     juce::SmoothedValue<double> gain {1.0}, outputGain {1.0};
+    juce::SmoothedValue<double> originalBlend {0.0};
     std::array<unsigned, 85> learningHistogram {}, energyHistogram {};
     unsigned learningId = 0;
+    double capturedEnergy = 0, capturedActivity = 0;
     float learnedCeiling = nx::floorDb, learnedSampleMax = nx::floorDb;
     int sampleRate = 48000, settings = -1;
 };
@@ -989,6 +1017,19 @@ public:
         analyze.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         analyze.setTooltip(utf8("Analisa e aplica o trim individual de cada pista ativa da sessão."));
         configureButton(review, utf8("Prévia de ganho"), [this] { capture(); });
+        configureButton(levelRms, "Nivelar RMS", [this] { startAnalysis(false, true); });
+        levelRms.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
+        configureButton(original, "Ouvir original", [this]
+        {
+            const bool active = !plugin.auditionOriginal.load();
+            plugin.auditionOriginal.store(active);
+            original.setButtonText(active ? "Ouvir ajuste" : "Ouvir original");
+            original.setToggleState(active, juce::dontSendNotification);
+            status = active ? utf8("Áudio original na saída do MixPilot. Os inserts seguintes continuam ativos.")
+                            : utf8("Ouvindo o áudio com os ajustes do MixPilot.");
+            updateButtons();
+            repaint();
+        });
         configureButton(apply, "Aplicar trim", [this] { commit(); });
         apply.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff135f72));
         configureButton(audition, "Ouvir B", [this] { togglePreview(); });
@@ -1059,6 +1100,7 @@ public:
     ~Editor() override
     {
         stopTimer();
+        plugin.auditionOriginal.store(false);
         clearTonePreview();
         if (analyzing)
             assignLearning(0);
@@ -1112,6 +1154,8 @@ public:
         limiterToggle.setBounds(732, 802, 164, 26);
         limiterCeiling.setBounds(898, 803, 131, 26);
         analyze.setBounds(16, 652, 127, 34);
+        levelRms.setBounds(29, 491, 134, 28);
+        original.setBounds(171, 491, 144, 28);
         review.setBounds(153, 652, 146, 34);
         audition.setBounds(309, 652, 116, 34);
         cancel.setBounds(435, 652, 99, 34);
@@ -1242,8 +1286,8 @@ public:
         {
             label(g, utf8("BALANÇO LOCAL"), 26, 407, 630, 23, 17, ink, true);
             drawRows(g);
-            label(g, utf8("Defina a hierarquia no HUB. O tipo abaixo se aplica a Auto ou Acompanhamento."),
-                  28, 526, 641, 25, 14);
+            label(g, utf8("Nivelar RMS usa o alvo 0 VU e respeita a margem de pico."),
+                  28, 526, 641, 25, 13);
             label(g, "Tipo de acompanhamento", 28, 553, 270, 20, 12);
             label(g, utf8("Referência de pico por instrumento"), 324, 553, 350, 20, 12);
             if (!rows.empty() && strategy() == nx::GainStrategy::technical)
@@ -1256,9 +1300,15 @@ public:
                     : utf8("Referência RMS: ") + number(plugin.value("reference")) + " dBFS";
                 label(g, referenceText, 325, 602, 356, 18, 12, cyan);
             }
-            const auto meterRms = std::hypot(local.outputLevels.rms[0], local.outputLevels.rms[1]) / std::sqrt(2.0f);
+            const auto meterDb = [](const nx::StereoLevels& levels)
+            {
+                return nx::db(std::hypot(levels.rms[0], levels.rms[1]) / std::sqrt(2.0f));
+            };
+            const auto rmsIn = meterDb(local.inputLevels), rmsOut = meterDb(local.outputLevels);
+            const auto difference = rmsOut - rmsIn;
             label(g, utf8("Saída do insert  /  ") + (localSignal()
-                ? "RMS " + number(nx::db(meterRms)) + " dBFS   Pico " + number(local.outputPeak) + " dBFS"
+                ? "RMS " + number(rmsOut) + " dBFS   Pico " + number(local.outputPeak)
+                    + utf8(" dBFS   Diferença RMS ") + (difference > 0 ? "+" : "") + number(difference) + " dB"
                 : utf8("—")), 28, 619, 647, 15, 12, cyan);
             label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);
             label(g, utf8("Sessão ") + juce::String(plugin.session()) + "  /  Grupo " + juce::String(plugin.group()),
@@ -1921,16 +1971,18 @@ private:
         }
         const auto amount = tonalPanel.intensity.getValue() / 100;
         const auto cap = tonalPanel.limit.getValue();
+        bool capturedSignal = false;
         {
             std::lock_guard<std::mutex> lock(registry().mutex);
             for (const auto& row : rows)
             {
                 const auto* track = findTrack(row.identity);
                 const bool chosen = plugin.hub() ? tonalTargets.count(row.identity) != 0 : row.identity == plugin.identity;
-                if (!chosen || !row.spectralCurrent || row.tonalBus
+                if (!chosen || !row.spectralCurrent || !row.reading.active() || row.tonalBus
                     || track == nullptr || !track->eligible(plugin.session()) || !track->eqUnlocked()
-                    || nx::spectrumEnergy(row.spectrum.before) < 1.0e-9)
+                    || row.spectrum.frames < 4 || nx::spectrumEnergy(row.spectrum.before) < 1.0e-9)
                     continue;
+                capturedSignal = true;
                 TonalChange item;
                 item.track = row.identity;
                 item.before = track->tone();
@@ -1960,8 +2012,6 @@ private:
                 {
                     const int categoryId = row.instrument > 0 ? nx::presets[row.instrument - 1].category
                         : row.role == nx::bass ? 1 : row.role == nx::drums ? 0 : row.role == nx::backingVocal ? 6 : 2;
-                    if (row.spectrum.frames < 4)
-                        continue;
                     const auto& measured = row.spectrum.longBefore;
                     const auto target = profile == 9 ? tonalReference : nx::adaptiveTarget(measured, categoryId,
                         row.role == nx::focus || row.function == nx::Function::lead,
@@ -1998,9 +2048,12 @@ private:
         tonalSession = plugin.session();
         populateToneBands();
         updateCompensation();
-        tonalPanel.status = tonalPending.empty()
-            ? utf8("Sem correção sugerida. Confira os alvos, o áudio e, no mascaramento, a posição sincronizada.")
-            : utf8("Sugestões prontas. Ouça em B ou aprove com Aplicar EQ.");
+        if (!tonalPending.empty())
+            tonalPanel.status = utf8("Sugestões prontas. Ouça em B ou aprove com Aplicar EQ.");
+        else if (!capturedSignal)
+            tonalPanel.status = utf8("Reproduza um trecho com sinal na pista alvo e sugira o EQ novamente.");
+        else
+            tonalPanel.status = utf8("Nenhuma correção justificada no trecho analisado.");
     }
 
     bool canCommitTone(const TonalChange& item) const
@@ -2157,7 +2210,8 @@ private:
     {
         if (!tonalPanel.isVisible())
             return;
-        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
+        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f
+            && !plugin.auditionOriginal.load();
         if (tonalPreviewOn && (!writable || tonalSession != plugin.session()))
             cancelTonal();
         const auto source = tonalPanel.genre.getSelectedId() == 10 && nx::spectrumEnergy(tonalReference) > 1.0e-10
@@ -2716,6 +2770,13 @@ private:
             discard(utf8("Prévia cancelada após alteração de sessão, estilo, instância ou bypass."));
 
         const bool isHub = plugin.hub();
+        levelRms.setVisible(!isHub);
+        original.setVisible(!isHub);
+        if (isHub && plugin.auditionOriginal.exchange(false))
+        {
+            original.setButtonText("Ouvir original");
+            original.setToggleState(false, juce::dontSendNotification);
+        }
         operation.setVisible(isHub);
         gainStyle.setBounds(isHub ? 594 : 685, isHub ? 114 : 75, 121, 27);
         if (instruments.getSelectedId() != static_cast<int>(plugin.value("instrument")) + 1)
@@ -2888,11 +2949,15 @@ private:
 
     void updateButtons()
     {
-        analyze.setToggleState(analyzing, juce::dontSendNotification);
-        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
+        analyze.setToggleState(analyzing && !rmsLeveling, juce::dontSendNotification);
+        levelRms.setToggleState(analyzing && rmsLeveling, juce::dontSendNotification);
+        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f
+            && !plugin.auditionOriginal.load();
         const bool staticGain = writable && !plugin.usesContinuousGain();
         analyze.setEnabled(staticGain && !freeze.getToggleState());
         autoGain.setEnabled(staticGain && !freeze.getToggleState());
+        levelRms.setEnabled(staticGain && !freeze.getToggleState() && !analyzing && !plugin.gainBus() && plugin.volumeUnlocked());
+        original.setEnabled(!analyzing && !listening && plugin.value("bypass") < 0.5f);
         continuousToggle.setEnabled(!plugin.gainBus() && plugin.volumeUnlocked());
         limiterToggle.setEnabled(plugin.value("referenceOnly") < 0.5f);
         limiterCeiling.setEnabled(limiterToggle.getToggleState());
@@ -2911,15 +2976,17 @@ private:
                 plugin.value("sensitivity"), plugin.value("trueCeiling"), plugin.value("smartStrategy"), plugin.value("gainStyle")};
     }
 
-    void startAnalysis(bool previewOnly = false)
+    void startAnalysis(bool previewOnly = false, bool byRms = false)
     {
-        if (freeze.getToggleState() || (!previewOnly && (analysisOnly.getToggleState() || plugin.usesContinuousGain()))
+        if (plugin.auditionOriginal.load() || freeze.getToggleState()
+            || (!previewOnly && (analysisOnly.getToggleState() || plugin.usesContinuousGain()))
             || analyzing || plugin.value("bypass") > 0.5f)
             return;
-        discard(plugin.hub()
+        discard(byRms ? utf8("Nivelando RMS. Mantenha um trecho representativo em reprodução.") : plugin.hub()
             ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
             : utf8("ANALYZER  /  Mantenha a pista em reprodução. O trim local será ajustado."));
         smartAnalysing = previewOnly;
+        rmsLeveling = byRms;
         requestedSettings = analysisSettings();
         {
             std::lock_guard<std::mutex> lock(registry().mutex);
@@ -3101,13 +3168,25 @@ private:
             && row.reading.learnedPeak > nx::floorDb;
     }
 
+    bool hasCapturedRms(const TrackRow& row) const
+    {
+        return row.reading.learningId == activeLearning && row.reading.learnedActiveWindows >= 4
+            && row.reading.learnedRms > nx::floorDb;
+    }
+
     nx::SmartGainResult diagnoseGain(const TrackRow& row, float anchor, bool learned) const
     {
         auto reading = row.reading;
+        const bool byRms = learned && rmsLeveling;
         const auto maxSample = std::max(reading.peak, learned ? reading.learnedMaxSample : nx::floorDb);
         if (learned && reading.learnedPeak > nx::floorDb)
             reading.peak = reading.learnedPeak;
-        if (strategy() == nx::GainStrategy::musical)
+        if (byRms)
+        {
+            reading.rms = reading.learnedRms;
+            reading.settled = true;
+        }
+        else if (strategy() == nx::GainStrategy::musical)
             reading.rms = nx::musicalRms(reading, row.role == nx::focus, learned, row.outputGainDb);
         else if (strategy() == nx::GainStrategy::hybrid)
         {
@@ -3126,12 +3205,13 @@ private:
         const auto categoryId = row.instrument > 0 ? nx::presets[row.instrument - 1].category : 2;
         const auto chosenRole = strategy() == nx::GainStrategy::hybrid && focusRow >= 0
                 && rows[static_cast<std::size_t>(focusRow)].identity == row.identity ? nx::focus : row.role;
-        return nx::smartGain({reading, strategy(), chosenRole, row.function, categoryId, row.priority,
-                              row.peakProfile, row.trim, target, anchor, plugin.value("limit"), headroomDb, maximum,
+        return nx::smartGain({reading, byRms ? nx::GainStrategy::technical : strategy(), chosenRole, row.function, categoryId, row.priority,
+                              byRms ? 0 : row.peakProfile, row.trim, byRms ? 1.0f : target,
+                              byRms ? plugin.value("reference") - row.outputGainDb : anchor, plugin.value("limit"), headroomDb, maximum,
                               row.instrumentCeiling, maxSample, row.outputGainDb + row.toneBoost,
                               static_cast<nx::GainStyle>(static_cast<int>(plugin.value("gainStyle"))),
                               styleLane(row), row.customPeak > 0 && row.peakProfile == 0 && row.instrument > 0,
-                              learned && usesCapturedPeak(row)});
+                              learned && !byRms && usesCapturedPeak(row), byRms});
     }
 
     void capture()
@@ -3162,6 +3242,8 @@ private:
                 return canSuggest(row);
             if (row.reading.learningId != activeLearning || row.gainBus)
                 return false;
+            if (rmsLeveling)
+                return hasCapturedRms(row);
             if (calibratesByPeak(row))
                 return usesCapturedPeak(row);
             return canSuggest(row) && row.reading.learnedActiveWindows >= 4;
@@ -3241,7 +3323,7 @@ private:
             }
             if (std::abs(row.trim - next) >= 0.009f)
                 pending.push_back({row.identity, row.trim, next, {},
-                    automatic && usesCapturedPeak(row) ? activeLearning : 0});
+                    automatic && (rmsLeveling ? hasCapturedRms(row) : usesCapturedPeak(row)) ? activeLearning : 0});
         }
         if (automatic)
         {
@@ -3275,8 +3357,8 @@ private:
             return false;
         nx::Reading reading;
         if (!track->measurement.read(reading, capturedSession)
-            || (!reading.active() && !(change.peakCaptureId != 0 && reading.learningId == change.peakCaptureId
-                && reading.learnedPeak > nx::floorDb)))
+            || (!reading.active() && !(change.captureId != 0 && reading.learningId == change.captureId
+                && (reading.learnedPeak > nx::floorDb || reading.learnedActiveWindows >= 4))))
             return false;
         const auto truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
                                                        reading.inputLevels.truePeak.end()));
@@ -3309,7 +3391,7 @@ private:
 
     void togglePreview()
     {
-        if (analysisOnly.getToggleState())
+        if (analysisOnly.getToggleState() || plugin.auditionOriginal.load())
             return;
         std::lock_guard<std::mutex> lock(registry().mutex);
         if (listening)
@@ -3360,11 +3442,13 @@ private:
         clearPreview();
         const auto count = pending.size();
         const auto trackTrim = pending.front().next;
+        const auto difference = trackTrim - pending.front().previous;
         plugin.redoHistory.clear();
         plugin.history.push_back(std::move(pending));
         pending.clear();
         status = capturedHub ? juce::String(count) + " trims internos aplicados. Desfazer restaura os valores anteriores."
-            : utf8("Trim aplicado: ") + number(trackTrim) + utf8(" dB. Confira a saída do insert ou use Desfazer.");
+            : utf8("Trim aplicado: ") + number(trackTrim) + " dB  /  "
+                + utf8("Mudança: ") + (difference > 0 ? "+" : "") + number(difference) + utf8(" dB. Use Ouvir original para comparar.");
     }
 
     void undoLast()
@@ -3436,7 +3520,7 @@ private:
     juce::Point<float> graphCursor {-1, -1};
     juce::ComboBox instance, role, operation, gainStyle, scope, pick, support, peakReference, category, instruments;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
-    juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
+    juce::TextButton analyze, review, levelRms, original, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
     juce::ToggleButton bypass, freeze, tonalExclude, continuousToggle, limiterToggle;
     juce::TextButton manualAnalyze, autoGain, resetHold;
@@ -3449,6 +3533,7 @@ private:
     std::vector<Change> pending;
     nx::Reading local;
     bool localCurrent = false, listening = false, analyzing = false;
+    bool rmsLeveling = false;
     std::array<float, 11> requestedSettings {};
     juce::uint32 analysisStarted = 0;
     unsigned activeLearning = 0;

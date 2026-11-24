@@ -338,6 +338,52 @@ int main()
     }
 
     {
+        Plugin vocal(createPluginFilter());
+        props.name = "VOCAL";
+        vocal->updateTrackProperties(props);
+        vocal->setPlayHead(&playhead);
+        vocal->prepareToPlay(rate, block);
+        write(*vocal, "trim", -3.83f);
+        write(*vocal, "reference", -18);
+        std::unique_ptr<juce::AudioProcessorEditor> vocalEditor(vocal->createEditor());
+        click(*vocalEditor, "Tonal Match");
+        click(*vocalEditor, "Sugerir EQ");
+        auto* tonalApply = dynamic_cast<juce::Button*>(findControl(*vocalEditor, "Aplicar EQ"));
+        require(tonalApply && !tonalApply->isEnabled() && read(*vocal, "toneG1") == 0,
+                "Tonal Match without captured audio must not enable Apply or write EQ.");
+        click(*vocalEditor, "Tonal Match");
+
+        click(*vocalEditor, "Nivelar RMS");
+        for (int frame = 0; frame < 34; ++frame)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                feed(*vocal, playhead, signal, midi, 375, frame < 18 ? 0.1 : 0.0, false);
+                playhead.position += block;
+            }
+            juce::Thread::sleep(47);
+            juce::Timer::callPendingTimersSynchronously();
+        }
+        require(std::abs(read(*vocal, "trim") - 5.01) < 0.08,
+                "RMS leveling must use captured active audio, even when the clip ends with a pause.");
+        const auto measure = [&]
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                feed(*vocal, playhead, signal, midi, 375, 0.1, false);
+                playhead.position += block;
+            }
+            return 20 * std::log10(signal.getRMSLevel(0, 0, block));
+        };
+        require(std::abs(measure() + 18) < 0.08, "RMS leveling must reach the nominal output on a known signal.");
+        click(*vocalEditor, "Ouvir original");
+        require(std::abs(measure() + 23.01) < 0.02 && std::abs(read(*vocal, "trim") - 5.01) < 0.08,
+                "Audition must restore the actual original audio without changing the saved trim.");
+        click(*vocalEditor, "Ouvir ajuste");
+        require(std::abs(measure() + 18) < 0.08, "Returning to the applied trim must restore the adjusted output.");
+    }
+
+    {
         Plugin dynamics(createPluginFilter());
         dynamics->prepareToPlay(rate, block);
         std::unique_ptr<juce::AudioProcessorEditor> dynamicsEditor(dynamics->createEditor());

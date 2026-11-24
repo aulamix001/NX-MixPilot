@@ -36,6 +36,7 @@ struct SmartGainInput
     StyleLane styleLane = StyleLane::other;
     bool stylePresetTarget = false;
     bool capturedPeak = false;
+    bool exactRms = false;
 };
 
 struct SmartGainResult
@@ -102,7 +103,7 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
         case GainStrategy::technical:
             desired = suggestTrim(signal, GainMode::calibration, input.anchor, role, 90, -90,
                                   input.legacyPeakProfile, technicalTarget, floorDb, input.capturedPeak).trim;
-            if (result.peakTarget > 0 && std::abs(desired - input.trim) <= tolerance(peakShape))
+            if (result.peakTarget > 0 && !input.exactRms && std::abs(desired - input.trim) <= tolerance(peakShape))
                 desired = input.trim;
             break;
         case GainStrategy::musical:
