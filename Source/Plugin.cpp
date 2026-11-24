@@ -57,6 +57,18 @@ struct PublishedLevels
 
 struct Measurement
 {
+    struct Loudness
+    {
+        void write(nx::LoudnessLevels reading)
+        {
+            momentary = reading.momentary;
+            shortTerm = reading.shortTerm;
+            integrated = reading.integrated;
+        }
+        nx::LoudnessLevels read() const { return {momentary.load(), shortTerm.load(), integrated.load()}; }
+        std::atomic<float> momentary {-120}, shortTerm {-120}, integrated {-120};
+    };
+
     void write(const nx::Reading& reading, int group)
     {
         ++version;
@@ -67,6 +79,8 @@ struct Measurement
         outputPeak.store(reading.outputPeak);
         input.write(reading.inputLevels);
         output.write(reading.outputLevels);
+        inputLoudness.write(reading.inputLoudness);
+        outputLoudness.write(reading.outputLoudness);
         learningId.store(reading.learningId);
         learnedPeak.store(reading.learnedPeak);
         learnedMaxSample.store(reading.learnedMaxSample);
@@ -96,6 +110,8 @@ struct Measurement
         reading.outputPeak = outputPeak.load();
         reading.inputLevels = input.read();
         reading.outputLevels = output.read();
+        reading.inputLoudness = inputLoudness.read();
+        reading.outputLoudness = outputLoudness.read();
         reading.learningId = learningId.load();
         reading.learnedPeak = learnedPeak.load();
         reading.learnedMaxSample = learnedMaxSample.load();
@@ -118,6 +134,7 @@ struct Measurement
     }
 
     PublishedLevels input, output;
+    Loudness inputLoudness, outputLoudness;
     std::atomic<unsigned> version {0}, learningId {0};
     std::atomic<float> learnedPeak {nx::floorDb}, learnedCeiling {nx::floorDb}, learnedEnergy {nx::floorDb}, learnedLoudEnergy {nx::floorDb}, learnedMaxSample {nx::floorDb};
     std::atomic<unsigned> learnedActiveWindows {0};
@@ -491,6 +508,8 @@ public:
         equalizer.prepare(rate);
         inputMeter.prepare(rate);
         outputMeter.prepare(rate);
+        inputLoudness.prepare(rate);
+        outputLoudness.prepare(rate);
         gain.reset(rate, 0.035);
         outputGain.reset(rate, 0.035);
         outputGain.setCurrentAndTargetValue(1);
@@ -522,6 +541,8 @@ public:
         {
             inputMeter.resetHold();
             outputMeter.resetHold();
+            inputLoudness.reset();
+            outputLoudness.reset();
         }
         const auto sessionId = session();
         const auto isHub = hub();
@@ -529,6 +550,8 @@ public:
         if (settings != newSettings)
         {
             analyzer.reset();
+            inputLoudness.reset();
+            outputLoudness.reset();
             measurement.write({}, 0);
             settings = newSettings;
         }
@@ -582,6 +605,8 @@ public:
             };
             inputMeter.push(bounded(dryLeft), bounded(dryRight));
             outputMeter.push(bounded(wetLeft), bounded(wetRight));
+            inputLoudness.push(bounded(dryLeft), bounded(dryRight), right != nullptr);
+            outputLoudness.push(bounded(wetLeft), bounded(wetRight), right != nullptr);
             const auto position = hostPosition < 0 ? -1 : hostPosition + sample;
             spectrum.push({bounded(dryLeft), bounded(dryRight), bounded(wetLeft), bounded(wetRight),
                            position, sampleRate, sessionId});
@@ -589,6 +614,8 @@ public:
             {
                 reading.inputLevels = inputMeter.read();
                 reading.outputLevels = outputMeter.read();
+                reading.inputLoudness = inputLoudness.read();
+                reading.outputLoudness = outputLoudness.read();
                 if (learningId != 0)
                 {
                     const float measured = nx::db(*std::max_element(reading.inputLevels.peak.begin(), reading.inputLevels.peak.end()));
@@ -665,6 +692,7 @@ private:
     juce::String hostTrackName; // VST3 channel-context callbacks and the editor use the message thread.
     nx::Analyzer analyzer;
     nx::GainMeter inputMeter, outputMeter;
+    nx::LoudnessMeter inputLoudness, outputLoudness;
     juce::SmoothedValue<double> gain {1.0}, outputGain {1.0};
     std::array<unsigned, 85> learningHistogram {}, energyHistogram {};
     unsigned learningId = 0;
@@ -973,7 +1001,7 @@ public:
         configureButton(resetHold, "RESET", [this]
         {
             plugin.holdReset.store(true);
-            status = utf8("Peak hold reiniciado nesta instância.");
+            status = utf8("Peak hold e histórico de LUFS reiniciados nesta instância.");
         });
         freeze.setButtonText("FREEZE");
         addAndMakeVisible(freeze);
@@ -1339,11 +1367,25 @@ private:
         render(local.inputLevels, 1, 898, "Entrada R");
         render(local.outputLevels, 0, 916, "Saída L");
         render(local.outputLevels, 1, 934, "Saída R");
+        const auto lufs = [&](float value) { return localCurrent && value > -120 ? number(value) : utf8("—"); };
+        const auto renderLoudness = [&](const char* name, nx::LoudnessLevels values, int y)
+        {
+            label(g, utf8(name), 808, y, 53, 17, 11);
+            label(g, lufs(values.momentary), 867, y, 46, 17, 11, ink);
+            label(g, lufs(values.shortTerm), 918, y, 46, 17, 11, ink);
+            label(g, lufs(values.integrated), 969, y, 46, 17, 11, ink);
+        };
+        label(g, "LUFS", 808, 878, 53, 16, 11, cyan);
+        label(g, "M", 867, 878, 46, 16, 11, cyan);
+        label(g, "S", 918, 878, 46, 16, 11, cyan);
+        label(g, "I", 969, 878, 46, 16, 11, cyan);
+        renderLoudness("Entrada", local.inputLoudness, 896);
+        renderLoudness("Saída", local.outputLoudness, 913);
         const auto peak = *std::max_element(local.outputLevels.hold.begin(), local.outputLevels.hold.end());
         if (localCurrent && peak >= 1.0f)
-            badge(g, "CLIP", 808, 895, 58, 0xffff725d);
+            badge(g, "CLIP", 808, 932, 58, 0xffff725d);
         else if (localCurrent && nx::db(peak) > plugin.value("trueCeiling"))
-            badge(g, "ACIMA DO LIMITE", 808, 895, 142, amber);
+            badge(g, "ACIMA DO LIMITE", 808, 932, 142, amber);
     }
 
     void drawMeters(juce::Graphics& g) const

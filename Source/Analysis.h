@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GainMeter.h"
+#include "LoudnessMeter.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +35,7 @@ struct Reading
     float outputPeak = floorDb;
     float activeRms = floorDb, activity = 0;
     StereoLevels inputLevels {}, outputLevels {};
+    LoudnessLevels inputLoudness, outputLoudness;
     float learnedPeak = floorDb, learnedCeiling = floorDb, learnedMaxSample = floorDb;
     unsigned learningId = 0, learnedActiveWindows = 0;
     float learnedEnergy = floorDb, learnedLoudEnergy = floorDb;

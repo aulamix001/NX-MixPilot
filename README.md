@@ -75,6 +75,8 @@ Os valores da tabela são escolhas de mixagem. A recomendação [ITU-R BS.1770](
 
 ## Gain staging universal
 
+Em **Avançado**, os medidores **LUFS** exibem separadamente entrada e saída. **M** usa 400 ms, **S** usa 3 s e **I** acumula a medição desde a abertura da sessão de áudio ou o último **RESET**. O meter usa ponderação K e gates absoluto e relativo. O gate integrado usa faixas de 0,1 LU. As leituras são informativas e o Auto Gain continua usando as referências de pico ou RMS do modo escolhido. **RESET** limpa o histórico de loudness e o peak hold da instância.
+
 - Em modo Track, deixe **Automático pelo nome da pista** para identificar presets por nomes e apelidos comuns. Quando o nome do host é genérico ou não é reconhecido, selecione categoria e instrumento ou use a referência RMS legada. Esta classificação usa o nome recebido do host.
 - **ANALYZE** captura a proposta manual para **Aplicar trim**. **AUTO GAIN** e o **ANALYZER** original medem o trecho selecionado e aplicam um trim estático após a janela. O HUB aprende as pistas Track da sessão. **FREEZE** mantém o ganho aprendido e suspende novos ciclos automáticos. O modo **Somente análise** mantém os trims aplicados.
 - **Target de pico** aceita o alvo personalizado em dBFS ou **Preset**. A coluna de sugestão mostra o trim a aplicar. A janela vai de 1,2 a 20 segundos. **Sensibilidade** percorre o percentil 85 ao 100 dos picos por janela. O máximo true peak observado continua sendo usado para limitar o ganho.

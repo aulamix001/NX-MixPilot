@@ -130,5 +130,29 @@ int main()
     expect(intersample.truePeak[0] >= 0.88f && intersample.truePeak[0] <= 0.93f,
            "4x true peak must recover the inter-sample maximum of a quarter-rate sine.");
     expect(intersample.peak[1] == 0 && intersample.truePeak[1] == 0, "Silent right channel must remain silent.");
-    std::cout << "RMS, sample peak, nominal and custom calibration, group gain, musical roles and spectral alignment passed.\n";
+    for (const int rate : {44100, 48000, 96000})
+    {
+        nx::LoudnessMeter mono, stereo;
+        mono.prepare(rate);
+        stereo.prepare(rate);
+        for (int i = 0; i < rate * 4; ++i)
+        {
+            const auto sine = 0.1 * std::sin(2 * 3.141592653589793 * 1000 * i / rate);
+            mono.push(sine, sine, false);
+            stereo.push(sine, -sine, true);
+        }
+        const auto measured = stereo.read();
+        expect(near(measured.momentary, -20, 0.1f) && near(measured.shortTerm, -20, 0.1f)
+            && near(measured.integrated, -20, 0.1f), "A stereo 1 kHz tone must match the LUFS reference.");
+        expect(near(measured.integrated - mono.read().integrated, 3.0103f, 0.02f),
+               "Mono must count one physical channel and stereo must sum powers independently of polarity.");
+        for (int i = 0; i < rate * 4; ++i)
+            stereo.push(0, 0, true);
+        expect(stereo.read().momentary == -120 && stereo.read().shortTerm == -120
+               && near(stereo.read().integrated, measured.integrated, 0.2f),
+               "Silence must clear the time windows and preserve gated integrated loudness.");
+        stereo.reset();
+        expect(stereo.read().integrated == -120, "Reset must discard the previous loudness history.");
+    }
+    std::cout << "Peak, RMS, VU, LUFS, calibration, group gain and spectral alignment passed.\n";
 }
