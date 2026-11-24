@@ -21,6 +21,29 @@ jobs:
         run: cmake --build --preset windows-release --parallel 2
       - name: Run DSP tests
         run: ctest --preset windows-release --no-tests=error
+      - name: Run pluginval level 10
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'nx-pluginval-1.0.4.zip'
+          $tools = Join-Path $env:RUNNER_TEMP 'nx-pluginval-1.0.4'
+          Invoke-WebRequest -Uri 'https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip' -OutFile $zip
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ine 'c08e61ce3b96db41636f8ec7e76f4c7e2c13ebdac7fa1b5a1f52b4f32ec715ab') {
+            throw 'Unexpected pluginval ZIP checksum'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $tools
+          $bundle = (Resolve-Path -LiteralPath 'out/windows-x64/NXMixPilot_artefacts/Release/VST3/NX Audio MixPilot.vst3').Path
+          $logs = Join-Path $env:GITHUB_WORKSPACE 'validation'
+          New-Item -ItemType Directory -Path $logs -Force | Out-Null
+          $arguments = '--strictness-level 10 --timeout-ms 120000 --output-dir "' + $logs + '" --validate "' + $bundle + '"'
+          $validation = Start-Process -FilePath (Join-Path $tools 'pluginval.exe') -ArgumentList $arguments -Wait -PassThru
+          Get-ChildItem -LiteralPath $logs -File | ForEach-Object { Get-Content -LiteralPath $_.FullName }
+          if ($validation.ExitCode -ne 0) { throw "pluginval exited with code $($validation.ExitCode)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: pluginval-Windows-level-10
+          path: validation/
+          if-no-files-found: warn
       - name: Verify and package VST3
         shell: pwsh
         run: |
@@ -63,4 +86,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" NX-MixPilot-VST3-Windows-x64.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "NX Audio MixPilot $GITHUB_REF_NAME" \
-            --notes "VST3 Windows x64 com ANALYZER verde e ajuste individual de ganho. Extraia a pasta completa NX Audio MixPilot.vst3 para a pasta VST3 do Windows. O carregamento no Studio One 8 ainda precisa ser validado."
+            --notes "VST3 Windows x64 com visualização espectral seletiva, Tonal Balance Match e suporte ao fluxo de gain staging anterior. Extraia a pasta completa NX Audio MixPilot.vst3 para a pasta VST3 do Windows. O carregamento no Studio One 8 ainda precisa ser validado."

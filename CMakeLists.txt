@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(NXMixPilot VERSION 0.2.0 LANGUAGES C CXX)
+project(NXMixPilot VERSION 0.3.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -26,17 +26,29 @@ if(NX_BUILD_PLUGINS)
         FORMATS VST3
         VST3_CATEGORIES Fx Analyzer
         PRODUCT_NAME "NX Audio MixPilot")
-    target_sources(NXMixPilot PRIVATE Source/Plugin.cpp Source/Analysis.h Source/GlassLook.h Source/GainMeter.h Source/InstrumentPresets.h)
+    target_sources(NXMixPilot PRIVATE Source/Plugin.cpp Source/Analysis.h Source/GlassLook.h Source/GainMeter.h Source/InstrumentPresets.h
+        Source/TonalDSP.h Source/SpectralWorker.h Source/TonalPanel.h
+        Source/SmartGain.h Source/SmartPanel.h Source/ReferenceAudio.h)
     target_compile_definitions(NXMixPilot PRIVATE
-        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_USE_MP3AUDIOFORMAT=1)
     target_link_libraries(NXMixPilot PRIVATE
-        juce::juce_audio_processors juce::juce_gui_basics juce::juce_recommended_config_flags)
+        juce::juce_audio_processors juce::juce_gui_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
 endif()
 
 if(BUILD_TESTING)
     add_executable(NXAnalysisTests Tests/AnalysisTests.cpp)
     target_include_directories(NXAnalysisTests PRIVATE Source)
     add_test(NAME NXAnalysisTests COMMAND NXAnalysisTests)
+    add_executable(NXTonalTests Tests/TonalTests.cpp)
+    target_include_directories(NXTonalTests PRIVATE Source)
+    add_test(NAME NXTonalTests COMMAND NXTonalTests)
+    if(TARGET NXMixPilot)
+        add_executable(NXPluginIntegrationTests Tests/PluginIntegrationTests.cpp)
+        target_include_directories(NXPluginIntegrationTests PRIVATE Source "$<TARGET_PROPERTY:NXMixPilot,INCLUDE_DIRECTORIES>")
+        target_compile_definitions(NXPluginIntegrationTests PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1)
+        target_link_libraries(NXPluginIntegrationTests PRIVATE NXMixPilot)
+        add_test(NAME NXPluginIntegrationTests COMMAND NXPluginIntegrationTests)
+    endif()
 endif()
 
 if(MSVC AND TARGET NXMixPilot)

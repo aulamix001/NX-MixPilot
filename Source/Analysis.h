@@ -32,9 +32,11 @@ struct Reading
     float rms = floorDb;
     float peak = floorDb;
     float outputPeak = floorDb;
+    float activeRms = floorDb, activity = 0;
     StereoLevels inputLevels {}, outputLevels {};
     float learnedPeak = floorDb, learnedCeiling = floorDb;
-    unsigned learningId = 0;
+    unsigned learningId = 0, learnedActiveWindows = 0;
+    float learnedEnergy = floorDb;
     int sampleRate = 0;
     bool settled = false;
     std::int64_t position = -1;
@@ -74,26 +76,37 @@ public:
         meanSquare = 0;
         recentPeak = 0;
         recentOutputPeak = 0;
-        frames = 0;
+        frames = activeSamples = 0;
+        activePower = 0;
     }
 
     bool push(float left, float right, float outLeft, float outRight,
-              std::int64_t position, Reading& result)
+              std::int64_t position, Reading& result, bool withSpectrum = true)
     {
         if (position != nextPosition && (position >= 0 || nextPosition >= 0))
         {
             count = 0;
             sum = peak = outputPeak = 0;
             meanSquare = recentPeak = recentOutputPeak = 0;
-            frames = 0;
+            frames = activeSamples = 0;
+            activePower = 0;
         }
         nextPosition = position >= 0 ? position + 1 : -1;
         if (position >= 0 && count == 0 && position % fftSize != 0)
             return false;
 
-        signalLeft[count] = left;
-        signalRight[count] = right;
-        sum += (left * left + right * right) * 0.5f;
+        if (withSpectrum)
+        {
+            signalLeft[count] = left;
+            signalRight[count] = right;
+        }
+        const float energy = (left * left + right * right) * 0.5f;
+        sum += energy;
+        if (energy > 1.0e-6f)
+        {
+            activePower += energy;
+            ++activeSamples;
+        }
         peak = std::max({peak, std::abs(left), std::abs(right)});
         outputPeak = std::max({outputPeak, std::abs(outLeft), std::abs(outRight)});
         if (++count != fftSize)
@@ -108,17 +121,20 @@ public:
         result.rms = db(std::sqrt(meanSquare));
         result.peak = db(recentPeak);
         result.outputPeak = db(recentOutputPeak);
+        result.activeRms = activeSamples > 0 ? db(std::sqrt(activePower / activeSamples)) : floorDb;
+        result.activity = static_cast<float>(activeSamples) / fftSize;
         result.sampleRate = sampleRate;
         if (frames < sampleRate)
             frames += fftSize;
         result.settled = frames >= sampleRate * 3 / 4 && sum / fftSize > 1.0e-6f;
         result.position = position;
-        if (peak > 0.0001f)
+        if (withSpectrum && peak > 0.0001f)
         {
             addSpectrum(signalLeft, result.power);
             addSpectrum(signalRight, result.power);
         }
-        count = 0;
+        count = activeSamples = 0;
+        activePower = 0;
         sum = peak = outputPeak = 0;
         return true;
     }
@@ -155,7 +171,8 @@ private:
     std::array<std::complex<float>, fftSize> scratch {};
     std::array<std::complex<float>, fftSize / 2> rotation {};
     std::array<int, fftSize / 2> binBand {};
-    int sampleRate = 0, count = 0, frames = 0;
+    int sampleRate = 0, count = 0, frames = 0, activeSamples = 0;
+    float activePower = 0;
     std::int64_t nextPosition = -1;
     float sum = 0, peak = 0, outputPeak = 0, meanSquare = 0, recentPeak = 0, recentOutputPeak = 0;
 };

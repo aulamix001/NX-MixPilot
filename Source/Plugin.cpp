@@ -1,6 +1,12 @@
 #include "Analysis.h"
 #include "GlassLook.h"
 #include "InstrumentPresets.h"
+#include "SpectralWorker.h"
+#include "TonalPanel.h"
+#include "SmartGain.h"
+#include "SmartPanel.h"
+#include "ReferenceAudio.h"
+#include <set>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
@@ -55,6 +61,8 @@ struct Measurement
     {
         ++version;
         rms.store(reading.rms);
+        activeRms.store(reading.activeRms);
+        activity.store(reading.activity);
         peak.store(reading.peak);
         outputPeak.store(reading.outputPeak);
         input.write(reading.inputLevels);
@@ -62,6 +70,8 @@ struct Measurement
         learningId.store(reading.learningId);
         learnedPeak.store(reading.learnedPeak);
         learnedCeiling.store(reading.learnedCeiling);
+        learnedActiveWindows.store(reading.learnedActiveWindows);
+        learnedEnergy.store(reading.learnedEnergy);
         sampleRate.store(reading.sampleRate);
         settled.store(reading.settled);
         position.store(reading.position);
@@ -78,6 +88,8 @@ struct Measurement
         if ((before & 1u) || before == 0)
             return false;
         reading.rms = rms.load();
+        reading.activeRms = activeRms.load();
+        reading.activity = activity.load();
         reading.peak = peak.load();
         reading.outputPeak = outputPeak.load();
         reading.inputLevels = input.read();
@@ -85,6 +97,8 @@ struct Measurement
         reading.learningId = learningId.load();
         reading.learnedPeak = learnedPeak.load();
         reading.learnedCeiling = learnedCeiling.load();
+        reading.learnedActiveWindows = learnedActiveWindows.load();
+        reading.learnedEnergy = learnedEnergy.load();
         reading.sampleRate = sampleRate.load();
         reading.settled = settled.load();
         reading.position = position.load();
@@ -101,13 +115,60 @@ struct Measurement
 
     PublishedLevels input, output;
     std::atomic<unsigned> version {0}, learningId {0};
-    std::atomic<float> learnedPeak {nx::floorDb}, learnedCeiling {nx::floorDb};
+    std::atomic<float> learnedPeak {nx::floorDb}, learnedCeiling {nx::floorDb}, learnedEnergy {nx::floorDb};
+    std::atomic<unsigned> learnedActiveWindows {0};
+    std::atomic<float> activeRms {nx::floorDb}, activity {0};
     std::atomic<float> rms {nx::floorDb}, peak {nx::floorDb}, outputPeak {nx::floorDb};
     std::atomic<bool> settled {false};
     std::atomic<int> sampleRate {0}, session {0};
     std::atomic<std::int64_t> position {-1};
     std::atomic<juce::uint32> stamp {0};
     std::array<std::atomic<float>, nx::bands> power {};
+};
+
+constexpr std::array<const char*, 3> toneFrequencies {"toneF1", "toneF2", "toneF3"};
+constexpr std::array<const char*, 3> toneGains {"toneG1", "toneG2", "toneG3"};
+constexpr std::array<const char*, 3> toneQs {"toneQ1", "toneQ2", "toneQ3"};
+
+struct TonalChange
+{
+    unsigned track = 0;
+    nx::EqualizerSettings before, after;
+    double conflictHz = 0, phaseDifference = 999;
+};
+
+struct TonePreview
+{
+    void write(const nx::EqualizerSettings& settings, unsigned ownerId, int sessionId)
+    {
+        ++revision;
+        for (std::size_t i = 0; i < settings.bands.size(); ++i)
+        {
+            frequency[i] = static_cast<float>(settings.bands[i].frequency);
+            gain[i] = static_cast<float>(settings.bands[i].gain);
+            q[i] = static_cast<float>(settings.bands[i].q);
+        }
+        compensation = static_cast<float>(settings.compensation);
+        session = sessionId;
+        owner = ownerId;
+        ++revision;
+    }
+
+    bool read(nx::EqualizerSettings& settings, int sessionId) const
+    {
+        const auto start = revision.load();
+        if ((start & 1u) != 0 || owner.load() == 0 || session.load() != sessionId)
+            return false;
+        for (std::size_t i = 0; i < settings.bands.size(); ++i)
+            settings.bands[i] = {frequency[i].load(), gain[i].load(), q[i].load()};
+        settings.compensation = compensation.load();
+        return start == revision.load();
+    }
+
+    std::array<std::atomic<float>, 3> frequency {}, gain {}, q {};
+    std::atomic<float> compensation {0};
+    std::atomic<int> session {0};
+    std::atomic<unsigned> owner {0}, revision {0};
 };
 
 struct Change
@@ -207,6 +268,28 @@ public:
         result.add(std::make_unique<AudioParameterBool>(ParameterID{"freeze", 1}, "Freeze", false));
         result.add(std::make_unique<AudioParameterFloat>(ParameterID{"trueCeiling", 1}, "Limite true peak (dBTP)",
                         NormalisableRange<float>{-18, 0, 0.1f}, -1));
+        for (std::size_t band = 0; band < toneFrequencies.size(); ++band)
+        {
+            const auto index = juce::String(band + 1);
+            result.add(std::make_unique<AudioParameterFloat>(ParameterID{toneFrequencies[band], 1},
+                            utf8("EQ Frequência ") + index, NormalisableRange<float>{20, 20000, 0, 0.35f}, 1000));
+            result.add(std::make_unique<AudioParameterFloat>(ParameterID{toneGains[band], 1},
+                            "EQ Ganho " + index, NormalisableRange<float>{-12, 12}, 0));
+            result.add(std::make_unique<AudioParameterFloat>(ParameterID{toneQs[band], 1},
+                            "EQ Q " + index, NormalisableRange<float>{0.3f, 8}, 0.8f));
+        }
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"toneComp", 1}, utf8("Compensação tonal"),
+                        NormalisableRange<float>{-3, 3}, 0));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"toneBypass", 1}, "Bypass tonal", false));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"toneExclude", 1}, "Excluir do EQ", false));
+        result.add(std::make_unique<AudioParameterInt>(ParameterID{"smartStrategy", 1}, "Smart strategy", 0, 2, 0));
+        result.add(std::make_unique<AudioParameterInt>(ParameterID{"priority", 1}, "Prioridade", 0, 100, 50));
+        result.add(std::make_unique<AudioParameterInt>(ParameterID{"function", 1}, utf8("Função musical"), 0, 5, 0));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"volumeLock", 1}, "Travar volume", false));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"eqLock", 1}, "Travar EQ", false));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"referenceOnly", 1}, utf8("Pista de referência"), false));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"premasterPeak", 1}, utf8("Pico pré-master"),
+                        NormalisableRange<float>{-24, 0, 0.1f}, -6));
         return result;
     }
 
@@ -228,7 +311,10 @@ public:
         if (properties.name)
         {
             hostTrackName = properties.name->trim();
-            inferredInstrument = inferInstrument();
+            inferredInstrument.store(inferInstrument(), std::memory_order_relaxed);
+            const auto name = hostTrackName.toLowerCase();
+            namedBus.store(name.containsWholeWord("bus") || name == "master" || name == "main",
+                           std::memory_order_relaxed);
         }
     }
 
@@ -251,7 +337,7 @@ public:
     int instrument() const
     {
         const int selection = static_cast<int>(value("instrument"));
-        return selection > 0 ? selection : inferredInstrument;
+        return selection > 0 ? selection : inferredInstrument.load(std::memory_order_relaxed);
     }
 
     int inferInstrument() const
@@ -284,7 +370,52 @@ public:
         return 0;
     }
 
+    nx::EqualizerSettings tone() const
+    {
+        nx::EqualizerSettings settings;
+        for (std::size_t i = 0; i < settings.bands.size(); ++i)
+            settings.bands[i] = {value(toneFrequencies[i]), value(toneGains[i]), value(toneQs[i])};
+        settings.compensation = value("toneComp");
+        return settings;
+    }
+
+    void setTone(const nx::EqualizerSettings& request)
+    {
+        toneBatch.store(true);
+        for (std::size_t i = 0; i < request.bands.size(); ++i)
+        {
+            setParameter(toneFrequencies[i], static_cast<float>(request.bands[i].frequency));
+            setParameter(toneGains[i], static_cast<float>(request.bands[i].gain));
+            setParameter(toneQs[i], static_cast<float>(request.bands[i].q));
+        }
+        setParameter("toneComp", static_cast<float>(request.compensation));
+        toneBatch.store(false);
+    }
+
+    float tonalBoost() const
+    {
+        if (tonalBus() || value("toneBypass") > 0.5f)
+            return 0;
+        const auto settings = tone();
+        auto boost = std::max(0.0, settings.compensation);
+        for (const auto& band : settings.bands)
+            boost += std::max(0.0, band.gain);
+        return static_cast<float>(boost);
+    }
+
+    bool tonalBus() const
+    {
+        const int assigned = static_cast<int>(value("instrument"));
+        const int inferred = inferredInstrument.load(std::memory_order_relaxed);
+        const int instrumentId = assigned > 0 ? assigned : inferred;
+        return hub() || value("toneExclude") > 0.5f || namedBus.load(std::memory_order_relaxed)
+            || (instrumentId > 0 && nx::presets[instrumentId - 1].category == 7);
+    }
+
     bool eligible(int sessionId) const { return !hub() && session() == sessionId && value("bypass") < 0.5f; }
+    bool volumeUnlocked() const { return value("volumeLock") < 0.5f && value("referenceOnly") < 0.5f; }
+    bool eqUnlocked() const { return value("eqLock") < 0.5f && value("referenceOnly") < 0.5f; }
+
 
     const juce::String getName() const override { return "NX Audio MixPilot"; }
     bool acceptsMidi() const override { return false; }
@@ -323,6 +454,7 @@ public:
     {
         sampleRate = static_cast<int>(rate);
         analyzer.prepare(sampleRate);
+        equalizer.prepare(rate);
         inputMeter.prepare(rate);
         outputMeter.prepare(rate);
         gain.reset(rate, 0.035);
@@ -349,6 +481,7 @@ public:
         {
             learningId = request;
             learningHistogram.fill(0);
+            energyHistogram.fill(0);
             learnedCeiling = learnedSampleMax = nx::floorDb;
         }
         if (holdReset.exchange(false))
@@ -366,7 +499,7 @@ public:
             settings = newSettings;
         }
 
-        const auto audition = previewSession.load() == sessionId ? preview.load() : noPreview;
+        const auto audition = previewSession.load() == sessionId && volumeUnlocked() ? preview.load() : noPreview;
         const bool bypass = value("bypass") >= 0.5f;
         const float trim = isHub || bypass ? 0.0f : audition == noPreview ? value("trim") : audition;
         gain.setTargetValue(juce::Decibels::decibelsToGain(static_cast<double>(trim)));
@@ -378,6 +511,20 @@ public:
                 if (auto samples = position->getTimeInSamples(); samples && *samples >= 0)
                     hostPosition = *samples;
 
+        if (!toneBatch.load())
+        {
+            auto targetTone = tone();
+            if (tonalBus() || value("toneBypass") > 0.5f)
+                targetTone = {};
+            else
+            {
+                auto previewTone = targetTone;
+                if (eqUnlocked() && tonalPreview.read(previewTone, sessionId))
+                    targetTone = previewTone;
+            }
+            equalizer.update(targetTone);
+        }
+
         auto* left = buffer.getWritePointer(0);
         auto* right = buffer.getNumChannels() == 2 ? buffer.getWritePointer(1) : nullptr;
         nx::Reading reading;
@@ -388,8 +535,10 @@ public:
             const auto dryRight = right ? clean(right[sample]) : dryLeft;
             const auto ramp = gain.getNextValue() * outputGain.getNextValue();
             const auto applied = bypass ? 1.0 : ramp;
-            const auto wetLeft = clean(static_cast<Sample>(dryLeft * applied));
-            const auto wetRight = clean(static_cast<Sample>(dryRight * applied));
+            double equalizedLeft = dryLeft, equalizedRight = dryRight;
+            equalizer.process(equalizedLeft, equalizedRight);
+            const auto wetLeft = clean(bypass ? dryLeft : static_cast<Sample>(equalizedLeft * applied));
+            const auto wetRight = clean(bypass ? dryRight : static_cast<Sample>(equalizedRight * applied));
             left[sample] = wetLeft;
             if (right)
                 right[sample] = wetRight;
@@ -400,7 +549,9 @@ public:
             inputMeter.push(bounded(dryLeft), bounded(dryRight));
             outputMeter.push(bounded(wetLeft), bounded(wetRight));
             const auto position = hostPosition < 0 ? -1 : hostPosition + sample;
-            if (analyzer.push(bounded(dryLeft), bounded(dryRight), bounded(wetLeft), bounded(wetRight), position, reading))
+            spectrum.push({bounded(dryLeft), bounded(dryRight), bounded(wetLeft), bounded(wetRight),
+                           position, sampleRate, sessionId});
+            if (analyzer.push(bounded(dryLeft), bounded(dryRight), bounded(wetLeft), bounded(wetRight), position, reading, false))
             {
                 reading.inputLevels = inputMeter.read();
                 reading.outputLevels = outputMeter.read();
@@ -410,6 +561,8 @@ public:
                     const float truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(), reading.inputLevels.truePeak.end()));
                     if (measured > -60)
                         ++learningHistogram[static_cast<std::size_t>(std::clamp(static_cast<int>(std::ceil(measured)) + 60, 0, 84))];
+                    if (reading.activity >= 0.08f && reading.activeRms > -55.0f)
+                        ++energyHistogram[static_cast<std::size_t>(std::clamp(static_cast<int>(std::ceil(reading.activeRms)) + 60, 0, 84))];
                     learnedSampleMax = std::max(learnedSampleMax, measured);
                     learnedCeiling = std::max(learnedCeiling, truePeak);
                     reading.learningId = learningId;
@@ -429,6 +582,22 @@ public:
                         }
                     }
                 }
+                if (learningId != 0)
+                {
+                    for (auto count : energyHistogram)
+                        reading.learnedActiveWindows += count;
+                    unsigned accumulated = 0;
+                    const auto median = (reading.learnedActiveWindows + 1) / 2;
+                    for (std::size_t bin = 0; median > 0 && bin < energyHistogram.size(); ++bin)
+                    {
+                        accumulated += energyHistogram[bin];
+                        if (accumulated >= median)
+                        {
+                            reading.learnedEnergy = static_cast<float>(bin) - 60.0f;
+                            break;
+                        }
+                    }
+                }
                 measurement.write(reading, sessionId);
             }
         }
@@ -436,6 +605,10 @@ public:
 
     juce::AudioProcessorValueTreeState parameters;
     Measurement measurement;
+    nx::SpectralWorker spectrum;
+    TonePreview tonalPreview;
+    std::vector<std::vector<TonalChange>> tonalHistory, tonalRedo; // Message thread.
+    std::atomic<bool> toneBatch {false};
     std::atomic<unsigned> learningRequest {0};
     std::atomic<float> learningSensitivity {1};
     std::atomic<bool> holdReset {false};
@@ -444,16 +617,18 @@ public:
     unsigned identity = 0;
     int slot = -1;
     std::optional<float> lastAppliedTrim; // Message thread.
-    std::vector<std::vector<Change>> history; // Message thread.
+    std::vector<std::vector<Change>> history, redoHistory; // Message thread.
     unsigned previewOwner = 0; // Accessed under the registry mutex.
 
 private:
-    int inferredInstrument = 0;
+    std::atomic<int> inferredInstrument {0};
+    std::atomic<bool> namedBus {false};
+    nx::TonalEqualizer equalizer;
     juce::String hostTrackName; // VST3 channel-context callbacks and the editor use the message thread.
     nx::Analyzer analyzer;
     nx::GainMeter inputMeter, outputMeter;
     juce::SmoothedValue<double> gain {1.0}, outputGain {1.0};
-    std::array<unsigned, 85> learningHistogram {};
+    std::array<unsigned, 85> learningHistogram {}, energyHistogram {};
     unsigned learningId = 0;
     float learnedCeiling = nx::floorDb, learnedSampleMax = nx::floorDb;
     int sampleRate = 48000, settings = -1;
@@ -473,7 +648,13 @@ struct TrackRow
     bool adjusted = false;
     int peakProfile = 0;
     int instrument = 0;
-    float customPeak = 1.0f, outputGainDb = 0;
+    float customPeak = 1.0f, outputGainDb = 0, toneBoost = 0;
+    nx::SpectrumFrame spectrum;
+    bool spectralCurrent = false;
+    bool tonalBus = false, volumeLocked = false, eqLocked = false, referenceOnly = false;
+    int priority = 50;
+    nx::Function function = nx::Function::automatic;
+    nx::SmartGainResult diagnostics;
 };
 
 Processor* findTrack(unsigned identity)
@@ -578,6 +759,132 @@ public:
             button.setBounds(650, 447 + i * 30, 27, 24);
             addAndMakeVisible(button);
         }
+        spectrumMode.addItemList({"Mix Bus", "Solo", "Multi", "Compare", "Reference", "Before/After", "Clear"}, 1);
+        spectrumMode.setSelectedId(1);
+        spectrumMode.onChange = [this]
+        {
+            if (spectrumMode.getSelectedId() == 7)
+                displayedSpectra.clear();
+            repaint();
+        };
+        addAndMakeVisible(spectrumMode);
+        fftChoice.addItemList({"4096", "8192", "16384"}, 1);
+        fftChoice.setSelectedId(1);
+        fftChoice.onChange = [this] { configureSpectrum(); };
+        addAndMakeVisible(fftChoice);
+        for (int i = 0; i < visibleRows; ++i)
+        {
+            auto& checkbox = spectrumButtons[static_cast<std::size_t>(i)];
+            checkbox.setClickingTogglesState(false);
+            checkbox.setBounds(215, 447 + i * 30, 24, 24);
+            checkbox.onClick = [this, i] { selectSpectrum(firstRow + i, true); };
+            addAndMakeVisible(checkbox);
+            auto& target = tonalButtons[static_cast<std::size_t>(i)];
+            target.setClickingTogglesState(false);
+            target.setBounds(380, 447 + i * 30, 24, 24);
+            target.onClick = [this, i]
+            {
+                const auto index = static_cast<std::size_t>(firstRow + i);
+                if (!tonalPanel.isVisible() || index >= rows.size() || (rows[index].tonalBus || rows[index].eqLocked || rows[index].referenceOnly))
+                    return;
+                cancelTonal();
+                const auto id = rows[index].identity;
+                if (!tonalTargets.erase(id))
+                    tonalTargets.insert(id);
+                updatePrincipalButtons();
+                updateTonalPanel();
+            };
+            addChildComponent(target);
+        }
+        configureButton(normalise, "Norm", {});
+        normalise.setClickingTogglesState(true);
+        normalise.setTooltip(utf8("Normalizar a soma de energia apenas na visualização"));
+        configureButton(spectralFreeze, "Freeze", [this]
+        {
+            if (spectralFreeze.getToggleState())
+            {
+                frozenRows = rows;
+                frozenSpectrum = localSpectrum;
+                frozenCurrent = spectralCurrent;
+            }
+            else
+                frozenRows.clear();
+        });
+        spectralFreeze.setClickingTogglesState(true);
+        spectralFreeze.setTooltip("Congelar apenas o espectro");
+        configureButton(spectrumOptions, "Vista", [this] { showSpectrumOptions(); });
+        configureButton(smartToggle, "Smart Prepare", [this]
+        {
+            if (smartPanel.isVisible() && listening)
+                togglePreview();
+            clearTonePreview();
+            tonalPanel.setVisible(false);
+            smartPanel.setVisible(!smartPanel.isVisible());
+            if (smartPanel.isVisible())
+                smartPanel.toFront(false);
+            updatePrincipalButtons();
+            updateSmartPanel();
+        });
+        addChildComponent(smartPanel);
+        smartPanel.mode.onChange = [this]
+        {
+            const int selection = smartPanel.mode.getSelectedId();
+            if (selection <= 0)
+                return;
+            if (selection <= 2)
+                plugin.setParameter("operation", selection == 2 ? 1.0f : 0.0f);
+            plugin.setParameter("smartStrategy", static_cast<float>(std::max(0, selection - 2)));
+            cancelSmart();
+            timerCallback();
+        };
+        auto slider = [&](juce::Slider& field, const char* id)
+        {
+            sliders.push_back(std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(plugin.parameters, id, field));
+        };
+        slider(smartPanel.priority, "priority");
+        slider(smartPanel.busTarget, "premasterPeak");
+        choices.push_back(std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+            plugin.parameters, "function", smartPanel.function));
+        auto lock = [&](juce::Button& control, const char* id)
+        {
+            smartAttachments.push_back(std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+                plugin.parameters, id, control));
+        };
+        lock(smartPanel.volumeLock, "volumeLock");
+        lock(smartPanel.eqLock, "eqLock");
+        lock(smartPanel.referenceLock, "referenceOnly");
+        configureButton(tonalToggle, "Tonal Match", [this]
+        {
+            if (smartPanel.isVisible() && listening)
+                togglePreview();
+            smartPanel.setVisible(false);
+            if (tonalPanel.isVisible())
+                clearTonePreview();
+            tonalPanel.setVisible(!tonalPanel.isVisible());
+            if (tonalPanel.isVisible())
+                tonalPanel.toFront(false);
+            updatePrincipalButtons();
+            updateTonalPanel();
+        });
+        addChildComponent(tonalPanel);
+        tonalPanel.correction.onChange = [this] { loadToneBand(); };
+        for (auto* control : {&tonalPanel.frequency, &tonalPanel.gain, &tonalPanel.q})
+            control->onValueChange = [this] { editToneBand(); };
+        tonalPanel.compensation.onClick = [this] { updateCompensation(); };
+        tonalPanel.limit.onValueChange = [this]
+        {
+            for (auto& item : tonalPending)
+                nx::limitCorrection(item.after.bands, tonalPanel.limit.getValue());
+            loadToneBand();
+            updateCompensation();
+        };
+        const auto stored = plugin.parameters.state.getProperty("tonalReference").toString();
+        juce::StringArray values;
+        values.addTokens(stored, " ", "");
+        if (values.size() == nx::tonalBands)
+            for (int i = 0; i < nx::tonalBands; ++i)
+                tonalReference[i] = juce::jlimit(0.0f, 1.0e6f, values[i].getFloatValue());
+
         configureButton(analyze, "ANALYZER", [this] { startAnalysis(); });
         analyze.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff14627a));
         analyze.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xff167243));
@@ -624,6 +931,10 @@ public:
         addAndMakeVisible(freeze);
         freezeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
             plugin.parameters, "freeze", freeze);
+        tonalExclude.setButtonText("Excluir do EQ");
+        addAndMakeVisible(tonalExclude);
+        tonalExcludeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+            plugin.parameters, "toneExclude", tonalExclude);
         bypass.setButtonText("Bypass");
         addAndMakeVisible(bypass);
         bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -637,6 +948,7 @@ public:
     ~Editor() override
     {
         stopTimer();
+        clearTonePreview();
         if (analyzing)
             assignLearning(0);
         setLookAndFeel(nullptr);
@@ -662,6 +974,16 @@ public:
         trim.setBounds(807, 494, 128, 130);
         limit.setBounds(trim.getBounds());
 
+        spectrumMode.setBounds(294, 159, 115, 25);
+        fftChoice.setBounds(414, 159, 73, 25);
+        normalise.setBounds(491, 159, 53, 25);
+        spectralFreeze.setBounds(547, 159, 62, 25);
+        spectrumOptions.setBounds(612, 159, 70, 25);
+        tonalToggle.setBounds(865, 114, 162, 27);
+        smartToggle.setBounds(813, 75, 215, 27);
+        smartPanel.setBounds(703, 404, 336, 447);
+        tonalExclude.setBounds(724, 114, 135, 27);
+        tonalPanel.setBounds(703, 404, 336, 447);
         category.setBounds(17, 745, 190, 27);
         instruments.setBounds(214, 745, 220, 27);
         targetPeak.setBounds(447, 745, 122, 27);
@@ -684,6 +1006,15 @@ public:
 
     void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
     {
+        if (plotBounds().contains(event.position))
+        {
+            const double position = (event.position.x - plotBounds().getX()) / plotBounds().getWidth();
+            const double center = graphStart + position * graphSpan;
+            graphSpan = std::clamp(graphSpan * std::pow(0.45, wheel.deltaY), 16.0, 96.0);
+            graphStart = std::clamp(center - position * graphSpan, 0.0, 96.0 - graphSpan);
+            repaint();
+            return;
+        }
         if (!plugin.hub() || !juce::Rectangle<int>(12, 422, 684, 210).contains(event.getPosition()))
             return;
         firstRow = juce::jlimit(0, std::max(0, static_cast<int>(rows.size()) - visibleRows),
@@ -698,8 +1029,19 @@ public:
             return;
         const auto index = firstRow + (event.y - 445) / 30;
         if (index < static_cast<int>(rows.size()))
-            pick.setSelectedId(static_cast<int>(rows[static_cast<std::size_t>(index)].identity),
-                               juce::sendNotificationSync);
+            selectSpectrum(index, event.mods.isCtrlDown() || event.mods.isCommandDown());
+    }
+
+    void mouseMove(const juce::MouseEvent& event) override
+    {
+        graphCursor = plotBounds().contains(event.position) ? event.position : juce::Point<float>{-1, -1};
+        repaint(12, 150, 684, 244);
+    }
+
+    void mouseExit(const juce::MouseEvent&) override
+    {
+        graphCursor = {-1, -1};
+        repaint(12, 150, 684, 244);
     }
 
     void paint(juce::Graphics& g) override
@@ -741,7 +1083,7 @@ public:
             label(g, "0 VU RMS", 22, 113, 70, 27, 13);
             label(g, "Headroom", 229, 113, 69, 27, 13);
             label(g, "Limite de trim", 433, 113, 95, 27, 13);
-            label(g, utf8("HUB controla a sessão pelo master."), 681, 113, 348, 27, 13);
+
         }
 
         panel(g, 12, 150, 684, 244);
@@ -808,6 +1150,22 @@ public:
     }
 
 private:
+    nx::GainStrategy strategy() const
+    {
+        const auto value = plugin.value("smartStrategy");
+        if (value >= 1.5f)
+            return nx::GainStrategy::hybrid;
+        if (value >= 0.5f)
+            return nx::GainStrategy::preserve;
+        return mode() == nx::GainMode::musical ? nx::GainStrategy::musical : nx::GainStrategy::technical;
+    }
+
+    bool needsAnchor() const
+    {
+        const auto selection = strategy();
+        return plugin.hub() && (selection == nx::GainStrategy::musical || selection == nx::GainStrategy::hybrid);
+    }
+
     nx::GainMode mode() const
     {
         return !plugin.hub() || plugin.value("operation") < 0.5f ? nx::GainMode::calibration : nx::GainMode::musical;
@@ -941,7 +1299,7 @@ private:
         metric(utf8("Pico de amostra · saída"), signal ? number(local.outputPeak) + " dBFS" : dash, 250);
         metric("Headroom", signal ? number(-local.outputPeak) + " dB" : dash, 310);
         if (plugin.hub())
-            label(g, utf8("Pré-master · referência de pico: −6 dBFS"), 856, 363, 170, 23, 10, cyan);
+            label(g, utf8("Pré-master · referência: ") + number(plugin.value("premasterPeak")) + " dBFS", 856, 363, 170, 23, 10, cyan);
     }
 
     static juce::Colour spectrumColour(const TrackRow& row)
@@ -957,106 +1315,1156 @@ private:
         return (index / palette.size()) % 2 == 0 ? shade : shade.darker(0.25f);
     }
 
+    static juce::Rectangle<float> plotBounds() { return {62, 194, 612, 159}; }
+
+    void configureSpectrum()
+    {
+        const int length = std::max(0, fftChoice.getSelectedId() - 1);
+        plugin.spectrum.configure(length, averageMs);
+        if (plugin.hub())
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            for (auto* track : registry().tracks)
+                if (track && !track->hub() && track->session() == plugin.session())
+                    track->spectrum.configure(length, averageMs);
+        }
+    }
+
+    void selectSpectrum(int index, bool multiple)
+    {
+        if (index < 0 || index >= static_cast<int>(rows.size()))
+            return;
+        const auto identity = rows[static_cast<std::size_t>(index)].identity;
+        if (!multiple)
+        {
+            displayedSpectra.clear();
+            displayedSpectra.insert(identity);
+            spectrumMode.setSelectedId(2);
+        }
+        else
+        {
+            if (!displayedSpectra.erase(identity))
+                displayedSpectra.insert(identity);
+            spectrumMode.setSelectedId(3);
+        }
+        updatePrincipalButtons();
+        repaint();
+    }
+
+    static nx::Conflict pairConflict(const TrackRow* first, const TrackRow* second,
+                                     double low = 20, double high = 20000)
+    {
+        if (!first || !second || !first->spectralCurrent || !second->spectralCurrent
+            || first->spectrum.end < 0 || first->spectrum.end != second->spectrum.end
+            || first->spectrum.rate != second->spectrum.rate)
+            return {};
+        const double weight = 1.0 + std::max(0, first->priority - second->priority) / 100.0;
+        return nx::masking(first->spectrum.instant, second->spectrum.instant,
+                           first->spectrum.pan, second->spectrum.pan, low, high, weight);
+    }
+
+    const TrackRow* rowById(unsigned id) const
+    {
+        const auto found = std::find_if(rows.begin(), rows.end(), [id](const auto& row) { return row.identity == id; });
+        return found != rows.end() ? &*found : nullptr;
+    }
+
+    void setTonalReference(const nx::Spectrum& referencePower)
+    {
+        tonalReference = referencePower;
+        plugin.parameters.state.setProperty("tonalReference", serialiseSpectrum(referencePower), nullptr);
+        tonalPanel.genre.setSelectedId(10);
+        spectrumMode.setSelectedId(5);
+    }
+
+    void importTonalReference()
+    {
+        tonalChooser = std::make_unique<juce::FileChooser>(utf8("Importar referência tonal"), juce::File{}, "*.csv;*.wav;*.flac;*.mp3");
+        tonalChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+            [self = juce::Component::SafePointer<Editor>(this)](const juce::FileChooser& chooser)
+            {
+                if (self == nullptr)
+                    return;
+                const auto file = chooser.getResult();
+                if (!file.existsAsFile())
+                    return;
+                if (!file.hasFileExtension("csv"))
+                {
+                    self->analyseReferenceFile(file);
+                    return;
+                }
+                if (file.getSize() > 65536)
+                    return;
+                std::vector<std::pair<double, double>> points;
+                for (const auto& line : juce::StringArray::fromLines(file.loadFileAsString()))
+                {
+                    const auto columns = juce::StringArray::fromTokens(line, ",;", "");
+                    if (columns.size() < 2)
+                        continue;
+                    const auto hz = columns[0].getDoubleValue();
+                    const auto dBText = columns[1].trim();
+                    const auto dB = dBText.getDoubleValue();
+                    if (hz >= 20 && hz <= 20000 && dB >= -140 && dB <= 30
+                        && dBText.containsOnly("0123456789.+-") && dBText.containsAnyOf("0123456789"))
+                        points.emplace_back(std::log(hz), dB);
+                }
+                std::sort(points.begin(), points.end());
+                points.erase(std::unique(points.begin(), points.end(), [](const auto& a, const auto& b)
+                    { return a.first == b.first; }), points.end());
+                if (points.size() < 2)
+                {
+                    self->tonalPanel.status = utf8("CSV precisa de dois ou mais pontos de frequência e dB.");
+                    self->tonalPanel.repaint();
+                    return;
+                }
+                nx::Spectrum referencePower {};
+                for (int i = 0; i < nx::tonalBands; ++i)
+                {
+                    const auto query = std::log(nx::bandFrequency(i));
+                    const auto upper = std::lower_bound(points.begin(), points.end(), query,
+                        [](const auto& point, double hz) { return point.first < hz; });
+                    if (upper == points.begin() || upper == points.end())
+                        continue;
+                    const auto& lower = *(upper - 1);
+                    const auto fraction = (query - lower.first) / (upper->first - lower.first);
+                    referencePower[i] = static_cast<float>(std::pow(10.0, (lower.second + fraction * (upper->second - lower.second)) / 10.0));
+                }
+                self->referenceStats = {};
+                self->referenceLabel = file.getFileNameWithoutExtension();
+                self->setTonalReference(referencePower);
+                self->tonalPanel.status = utf8("Referência importada.");
+                self->tonalPanel.repaint();
+            });
+    }
+
+    static juce::String serialiseSpectrum(const nx::Spectrum& referencePower)
+    {
+        juce::StringArray serialized;
+        for (auto power : referencePower)
+            serialized.add(juce::String(power, 12));
+        return serialized.joinIntoString(" ");
+    }
+
+    static nx::Spectrum parseSpectrum(const juce::String& serialised)
+    {
+        nx::Spectrum power {};
+        const auto tokens = juce::StringArray::fromTokens(serialised, " ", "");
+        if (tokens.size() != nx::tonalBands)
+            return {};
+        for (int i = 0; i < nx::tonalBands; ++i)
+            power[i] = std::clamp(tokens[i].getFloatValue(), 0.0f, 1.0e6f);
+        return power;
+    }
+
+    void analyseReferenceFile(juce::File file)
+    {
+        static juce::ThreadPool referencePool(1);
+        const auto serial = ++referenceRequest;
+        tonalPanel.status = utf8("Analisando áudio da referência em segundo plano.");
+        referencePool.addJob([self = juce::Component::SafePointer<Editor>(this), file, serial]
+        {
+            const auto result = nx::loadReferenceAudio(file);
+            juce::MessageManager::callAsync([self, file, serial, result]
+            {
+                if (self == nullptr || self->referenceRequest != serial)
+                    return;
+                if (!result.valid)
+                    self->tonalPanel.status = utf8("Áudio inválido, silencioso ou com mais de dois canais.");
+                else
+                {
+                    self->referenceStats = result;
+                    self->referenceLabel = file.getFileNameWithoutExtension();
+                    self->setTonalReference(result.curve);
+                    self->tonalPanel.status = utf8("Referência de áudio pronta. Use Biblioteca para nomear e classificar.");
+                }
+                self->updateTonalPanel();
+            });
+        });
+    }
+
+    juce::ValueTree referenceLibrary() const
+    {
+        return plugin.parameters.state.getChildWithName("ReferenceLibrary");
+    }
+
+    void saveReferenceDialog()
+    {
+        if (nx::spectrumEnergy(tonalReference) <= 1.0e-10)
+            return;
+        auto* dialog = new juce::AlertWindow(utf8("Salvar referência"), "Nome, tipo e perfil",
+                                             juce::MessageBoxIconType::NoIcon);
+        dialog->addTextEditor("name", referenceLabel.isNotEmpty() ? referenceLabel : utf8("Minha referência"), "Nome");
+        dialog->addComboBox("type", {"Mix", "Master", "Instrumento"}, "Tipo");
+        juce::StringArray genres;
+        for (const auto& profile : nx::profiles)
+            genres.add(utf8(profile.name));
+        dialog->addComboBox("genre", genres, utf8("Gênero"));
+        dialog->getComboBoxComponent("type")->setSelectedItemIndex(referenceType, juce::dontSendNotification);
+        dialog->getComboBoxComponent("genre")->setSelectedId(tonalPanel.genre.getSelectedId(), juce::dontSendNotification);
+        dialog->addButton("Salvar", 1);
+        dialog->addButton("Cancelar", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+            [self = juce::Component::SafePointer<Editor>(this), dialog](int code)
+            {
+                if (self == nullptr || code != 1)
+                    return;
+                const auto name = dialog->getTextEditorContents("name").trim().substring(0, 80);
+                if (name.isEmpty())
+                    return;
+                auto library = self->referenceLibrary();
+                if (!library.isValid())
+                {
+                    library = juce::ValueTree("ReferenceLibrary");
+                    self->plugin.parameters.state.addChild(library, -1, nullptr);
+                }
+                if (library.getNumChildren() >= 128)
+                {
+                    self->tonalPanel.status = "Biblioteca cheia. Remova uma entrada antes de gravar.";
+                    self->tonalPanel.repaint();
+                    return;
+                }
+                juce::ValueTree entry("Reference");
+                entry.setProperty("name", name, nullptr);
+                entry.setProperty("type", dialog->getComboBoxComponent("type")->getSelectedItemIndex(), nullptr);
+                entry.setProperty("genre", dialog->getComboBoxComponent("genre")->getSelectedItemIndex(), nullptr);
+                entry.setProperty("curve", serialiseSpectrum(self->tonalReference), nullptr);
+                entry.setProperty("metrics", self->referenceStats.valid, nullptr);
+                entry.setProperty("loudness", self->referenceStats.loudness, nullptr);
+                entry.setProperty("rms", self->referenceStats.rms, nullptr);
+                entry.setProperty("peak", self->referenceStats.peak, nullptr);
+                entry.setProperty("crest", self->referenceStats.crest, nullptr);
+                entry.setProperty("balance", self->referenceStats.balance, nullptr);
+                entry.setProperty("correlation", self->referenceStats.correlation, nullptr);
+                entry.setProperty("duration", self->referenceStats.duration, nullptr);
+                library.addChild(entry, -1, nullptr);
+                self->referenceLabel = name;
+                self->tonalPanel.status = utf8("Referência salva na sessão.");
+                self->updateTonalPanel();
+            }), true);
+    }
+
+    void showReferenceLibrary()
+    {
+        juce::PopupMenu menu, open, merge, remove;
+        auto library = referenceLibrary();
+        menu.addItem(1, utf8("Salvar referência atual…"), nx::spectrumEnergy(tonalReference) > 1.0e-10);
+        const std::array<juce::String, 3> types {"Mix", "Master", "Instrumento"};
+        for (int i = 0; i < library.getNumChildren(); ++i)
+        {
+            const auto entry = library.getChild(i);
+            const auto type = std::clamp(static_cast<int>(entry.getProperty("type")), 0, 2);
+            const auto genre = std::clamp(static_cast<int>(entry.getProperty("genre")), 0, 9);
+            const auto label = types[type] + " / " + utf8(nx::profiles[genre].name) + " / " + entry["name"].toString();
+            open.addItem(100 + i, label);
+            merge.addItem(300 + i, label);
+            remove.addItem(500 + i, label);
+        }
+        menu.addSubMenu("Carregar", open, library.getNumChildren() > 0);
+        menu.addSubMenu("Combinar com atual", merge, library.getNumChildren() > 0 && nx::spectrumEnergy(tonalReference) > 1.0e-10);
+        menu.addSubMenu("Remover da biblioteca", remove, library.getNumChildren() > 0);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(tonalPanel),
+            [self = juce::Component::SafePointer<Editor>(this), library](int choice) mutable
+            {
+                if (self == nullptr || choice == 0)
+                    return;
+                if (choice == 1)
+                {
+                    self->saveReferenceDialog();
+                    return;
+                }
+                const int base = choice >= 500 ? 500 : choice >= 300 ? 300 : 100;
+                const auto entry = library.getChild(choice - base);
+                if (!entry.isValid())
+                    return;
+                if (base == 500)
+                {
+                    library.removeChild(entry, nullptr);
+                    self->tonalPanel.status = utf8("Referência removida da biblioteca.");
+                }
+                else
+                {
+                    auto curve = parseSpectrum(entry["curve"].toString());
+                    self->referenceStats = {};
+                    self->referenceType = std::clamp(static_cast<int>(entry.getProperty("type")), 0, 2);
+                    self->referenceLabel = entry["name"].toString();
+                    if (base == 300)
+                    {
+                        const auto a = nx::spectrumEnergy(self->tonalReference);
+                        const auto b = nx::spectrumEnergy(curve);
+                        if (a <= 1.0e-10 || b <= 1.0e-10)
+                            return;
+                        for (int i = 0; i < nx::tonalBands; ++i)
+                            curve[i] = static_cast<float>(0.5 * (self->tonalReference[i] / a + curve[i] / b));
+                        self->referenceLabel = "Combinada / " + self->referenceLabel;
+                    }
+                    else
+                    {
+                        self->referenceStats.valid = static_cast<bool>(entry.getProperty("metrics"));
+                        self->referenceStats.loudness = entry["loudness"];
+                        self->referenceStats.rms = entry["rms"];
+                        self->referenceStats.peak = entry["peak"];
+                        self->referenceStats.crest = entry["crest"];
+                        self->referenceStats.balance = entry["balance"];
+                        self->referenceStats.correlation = entry["correlation"];
+                        self->referenceStats.duration = entry["duration"];
+                    }
+                    self->setTonalReference(curve);
+                    self->tonalPanel.status = base == 300 ? utf8("Curvas combinadas após compensação de nível.")
+                                                           : utf8("Referência carregada.");
+                }
+                self->updateTonalPanel();
+            });
+    }
+
+    void selectToneTargets()
+    {
+        if (!plugin.hub())
+        {
+            tonalPanel.status = utf8("A pista local é o alvo no modo Track.");
+            return;
+        }
+        juce::PopupMenu menu;
+        menu.addItem(1, utf8("Todas as pistas elegíveis"));
+        menu.addItem(2, "Limpar alvos");
+        std::vector<unsigned> ids;
+        for (const auto& row : rows)
+        {
+            ids.push_back(row.identity);
+            menu.addItem(static_cast<int>(ids.size()) + 2, row.name, !row.tonalBus && !row.eqLocked && !row.referenceOnly,
+                         tonalTargets.count(row.identity) != 0);
+        }
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(tonalPanel),
+            [self = juce::Component::SafePointer<Editor>(this), ids = std::move(ids)](int id)
+            {
+                if (self == nullptr || id == 0)
+                    return;
+                self->cancelTonal();
+                if (id == 1 || id == 2)
+                {
+                    self->tonalTargets.clear();
+                    if (id == 1)
+                        for (const auto& row : self->rows)
+                            if (!row.tonalBus && !row.eqLocked && !row.referenceOnly)
+                                self->tonalTargets.insert(row.identity);
+                }
+                else if (static_cast<std::size_t>(id - 3) < ids.size())
+                {
+                    const auto track = ids[static_cast<std::size_t>(id - 3)];
+                    if (!self->tonalTargets.erase(track))
+                        self->tonalTargets.insert(track);
+                }
+                self->updateTonalPanel();
+            });
+    }
+
+    void clearTonePreviewLocked()
+    {
+        for (auto* track : registry().tracks)
+            if (track != nullptr && track->tonalPreview.owner.load() == plugin.identity)
+                track->tonalPreview.write({}, 0, 0);
+        tonalPreviewOn = false;
+    }
+
+    void clearTonePreview()
+    {
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        clearTonePreviewLocked();
+    }
+
+    void cancelTonal()
+    {
+        clearTonePreview();
+        tonalPending.clear();
+    }
+
+    void populateToneBands()
+    {
+        tonalPanel.correction.clear(juce::dontSendNotification);
+        for (std::size_t i = 0; i < tonalPending.size(); ++i)
+        {
+            const auto* row = rowById(tonalPending[i].track);
+            const auto name = row ? row->name : "Pista " + juce::String(tonalPending[i].track);
+            for (int band = 0; band < 3; ++band)
+                tonalPanel.correction.addItem(name + " / " + juce::String(band + 1),
+                    static_cast<int>(i * 3) + band + 1);
+        }
+        if (!tonalPending.empty())
+        {
+            tonalPanel.correction.setSelectedId(1, juce::dontSendNotification);
+            loadToneBand();
+        }
+    }
+
+    void loadToneBand()
+    {
+        const int index = tonalPanel.correction.getSelectedId() - 1;
+        if (index < 0 || static_cast<std::size_t>(index / 3) >= tonalPending.size())
+            return;
+        const auto& band = tonalPending[static_cast<std::size_t>(index / 3)].after.bands[static_cast<std::size_t>(index % 3)];
+        tonalPanel.frequency.setValue(band.frequency, juce::dontSendNotification);
+        tonalPanel.gain.setValue(band.gain, juce::dontSendNotification);
+        tonalPanel.q.setValue(band.q, juce::dontSendNotification);
+    }
+
+    void editToneBand()
+    {
+        const int index = tonalPanel.correction.getSelectedId() - 1;
+        if (index < 0 || static_cast<std::size_t>(index / 3) >= tonalPending.size())
+            return;
+        auto& bands = tonalPending[static_cast<std::size_t>(index / 3)].after.bands;
+        bands[static_cast<std::size_t>(index % 3)] =
+            {tonalPanel.frequency.getValue(), tonalPanel.gain.getValue(), tonalPanel.q.getValue()};
+        nx::limitCorrection(bands, tonalPanel.limit.getValue());
+        tonalPanel.gain.setValue(bands[static_cast<std::size_t>(index % 3)].gain, juce::dontSendNotification);
+        updateCompensation();
+    }
+
+    void updateCompensation()
+    {
+        for (auto& item : tonalPending)
+        {
+            const auto* row = rowById(item.track);
+            item.after.compensation = row && row->spectralCurrent && tonalPanel.compensation.getToggleState()
+                ? nx::estimateCompensation(row->spectrum.before, item.after.bands, row->spectrum.rate) : 0.0;
+        }
+        if (tonalPreviewOn)
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            for (const auto& item : tonalPending)
+                if (auto* track = findTrack(item.track); track && track->tonalPreview.owner.load() == plugin.identity)
+                    track->tonalPreview.write(item.after, plugin.identity, plugin.session());
+        }
+    }
+
+    void suggestTone(bool conflicts, bool append = false, int specialty = 0)
+    {
+        if (!append)
+            cancelTonal();
+        const auto profile = std::clamp(tonalPanel.genre.getSelectedId() - 1, 0, 9);
+        if (!conflicts && profile == 9 && nx::spectrumEnergy(tonalReference) <= 1.0e-10)
+        {
+            tonalPanel.status = utf8("Capture ou importe uma referência para o perfil Personalizado.");
+            return;
+        }
+        const TrackRow* focus = nullptr;
+        if (conflicts)
+        {
+            for (const auto& row : rows)
+                if (displayedSpectra.count(row.identity) && row.spectralCurrent
+                    && (specialty != 2 || (row.instrument > 0 && nx::presets[row.instrument - 1].category == 6))
+                    && (!focus || row.role == nx::focus || (focus->role != nx::focus && row.priority > focus->priority)))
+                    focus = &row;
+            if (!focus)
+            {
+                tonalPanel.status = specialty == 2 ? "Selecione um vocal reconhecido e seu acompanhamento na coluna Ver."
+                                                   : "Selecione as pistas para comparar na coluna Ver.";
+                return;
+            }
+        }
+        const auto amount = tonalPanel.intensity.getValue() / 100;
+        const auto cap = tonalPanel.limit.getValue();
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            for (const auto& row : rows)
+            {
+                const auto* track = findTrack(row.identity);
+                const bool chosen = plugin.hub() ? tonalTargets.count(row.identity) != 0 : row.identity == plugin.identity;
+                if (!chosen || !row.spectralCurrent || row.tonalBus
+                    || track == nullptr || !track->eligible(plugin.session()) || !track->eqUnlocked()
+                    || nx::spectrumEnergy(row.spectrum.before) < 1.0e-9)
+                    continue;
+                TonalChange item;
+                item.track = row.identity;
+                item.before = track->tone();
+                if (conflicts)
+                {
+                    if (&row == focus || !displayedSpectra.count(row.identity) || row.role == nx::focus)
+                        continue;
+                    const double low = specialty == 2 ? 220 : 20;
+                    const double high = specialty == 1 ? 300 : specialty == 2 ? 5000 : 20000;
+                    const auto conflict = pairConflict(focus, &row, low, high);
+                    if (conflict.band < 0 || amount <= 0 || focus->spectrum.frames < 4 || row.spectrum.frames < 4
+                        || focus->spectrum.longBefore[conflict.band] < 1.0e-8f
+                        || row.spectrum.longBefore[conflict.band] < 1.0e-8f)
+                        continue;
+                    item.conflictHz = nx::bandFrequency(conflict.band);
+                    const auto referenceHz = focus->spectrum.dominantHz[conflict.band];
+                    const auto otherHz = row.spectrum.dominantHz[conflict.band];
+                    if (referenceHz > 0 && std::abs(referenceHz - otherHz) < 0.1f)
+                    {
+                        const auto phase = focus->spectrum.phase[conflict.band] - row.spectrum.phase[conflict.band];
+                        item.phaseDifference = std::remainder(phase, 2 * nx::tonalPi) * 180.0 / nx::tonalPi;
+                    }
+                    const auto priority = 0.75 + 0.5 * std::max(0, focus->priority - row.priority) / 100.0;
+                    item.after.bands[0] = {item.conflictHz, -std::min(cap, 3.0 * amount * priority), 1.1};
+                }
+                else
+                {
+                    const int categoryId = row.instrument > 0 ? nx::presets[row.instrument - 1].category
+                        : row.role == nx::bass ? 1 : row.role == nx::drums ? 0 : row.role == nx::backingVocal ? 6 : 2;
+                    if (row.spectrum.frames < 4)
+                        continue;
+                    const auto& measured = row.spectrum.longBefore;
+                    const auto target = profile == 9 ? tonalReference : nx::adaptiveTarget(measured, categoryId,
+                        row.role == nx::focus || row.function == nx::Function::lead,
+                        nx::profiles[static_cast<std::size_t>(profile)]);
+                    const double tolerance = categoryId == 0 || row.function == nx::Function::ambience ? 2.75 : 1.75;
+                    item.after.bands = nx::match(measured, target, amount, cap, tolerance);
+                    if (row.spectrum.resonance >= 0 && amount > 0)
+                    {
+                        const auto band = row.spectrum.resonance;
+                        const auto wanted = -std::min(cap / 3, amount * 2);
+                        item.after.bands[2] = {nx::bandFrequency(band), wanted, 2.4};
+                        item.conflictHz = nx::bandFrequency(band);
+                        nx::limitCorrection(item.after.bands, cap);
+                    }
+                    if (std::none_of(item.after.bands.begin(), item.after.bands.end(), [](const auto& band)
+                        { return band.gain != 0; }))
+                        continue;
+                }
+                const auto existing = std::find_if(tonalPending.begin(), tonalPending.end(), [&](const auto& other)
+                    { return other.track == item.track; });
+                if (existing == tonalPending.end())
+                    tonalPending.push_back(item);
+                else if (conflicts)
+                {
+                    auto weakest = std::min_element(existing->after.bands.begin(), existing->after.bands.end(),
+                        [](const auto& a, const auto& b) { return std::abs(a.gain) < std::abs(b.gain); });
+                    *weakest = item.after.bands[0];
+                    existing->conflictHz = item.conflictHz;
+                    existing->phaseDifference = item.phaseDifference;
+                    nx::limitCorrection(existing->after.bands, cap);
+                }
+            }
+        }
+        tonalSession = plugin.session();
+        populateToneBands();
+        updateCompensation();
+        tonalPanel.status = tonalPending.empty()
+            ? utf8("Sem correção sugerida. Confira os alvos, o áudio e, no mascaramento, a posição sincronizada.")
+            : utf8("Sugestões prontas. Ouça em B ou aprove com Aplicar EQ.");
+    }
+
+    bool canCommitTone(const TonalChange& item) const
+    {
+        auto* target = findTrack(item.track);
+        return target != nullptr && target->eligible(tonalSession) && target->eqUnlocked() && !target->tonalBus()
+            && item.before == target->tone()
+            && (target->tonalPreview.owner.load() == 0 || target->tonalPreview.owner.load() == plugin.identity);
+    }
+
+    void finishTonal(nx::TonalPanel::Action action)
+    {
+        if (analysisOnly.getToggleState() || plugin.value("bypass") > 0.5f || tonalSession != plugin.session())
+        {
+            cancelTonal();
+            tonalPanel.status = utf8("Ative os ajustes e mantenha a sessão para usar o EQ.");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        if (tonalPreviewOn && action == nx::TonalPanel::preview)
+        {
+            clearTonePreviewLocked();
+            tonalPanel.status = "A: EQ aplicado antes da proposta.";
+            return;
+        }
+        if (tonalPending.empty() || !std::all_of(tonalPending.begin(), tonalPending.end(),
+                [this](const auto& item) { return canCommitTone(item) && safeTonalOutput(item); }))
+        {
+            clearTonePreviewLocked();
+            tonalPanel.status = utf8("Confira a sessão, a margem e os alvos. Gere novas sugestões.");
+            return;
+        }
+        if (action == nx::TonalPanel::preview)
+        {
+            if (std::any_of(tonalPending.begin(), tonalPending.end(), [](const auto& item)
+                { return findTrack(item.track)->value("toneBypass") > 0.5f; }))
+            {
+                tonalPanel.status = "Desligue o Bypass EQ nos alvos para ouvir a proposta.";
+                return;
+            }
+            for (const auto& item : tonalPending)
+                findTrack(item.track)->tonalPreview.write(item.after, plugin.identity, tonalSession);
+            tonalPreviewOn = true;
+            tonalPanel.status = utf8("B: prévia do EQ. A gravação do ajuste depende de Aplicar EQ.");
+        }
+        else
+        {
+            for (auto& item : tonalPending)
+            {
+                auto* target = findTrack(item.track);
+                target->setTone(item.after);
+                item.after = target->tone();
+            }
+            clearTonePreviewLocked();
+            plugin.tonalRedo.clear();
+            plugin.tonalHistory.push_back(std::move(tonalPending));
+            tonalPending.clear();
+            tonalPanel.status = utf8("EQ aplicado. Desfazer EQ restaura a configuração anterior.");
+        }
+    }
+
+    void undoTonal()
+    {
+        if (analysisOnly.getToggleState() || plugin.tonalHistory.empty())
+            return;
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        clearTonePreviewLocked();
+        tonalPending.clear();
+        auto& batch = plugin.tonalHistory.back();
+        std::vector<TonalChange> redone;
+        batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const auto& item)
+        {
+            auto* target = findTrack(item.track);
+            if (!target || !target->eqUnlocked() || target->session() != plugin.session() || !(target->tone() == item.after))
+                return false;
+            target->setTone(item.before);
+            redone.push_back(item);
+            return true;
+        }), batch.end());
+        const bool complete = batch.empty();
+        if (!redone.empty())
+            plugin.tonalRedo.push_back(std::move(redone));
+        if (complete)
+            plugin.tonalHistory.pop_back();
+        tonalPanel.status = complete ? "EQ restaurado." : utf8("Há pistas indisponíveis ou alteradas por automação.");
+    }
+
+    void handleTonal(nx::TonalPanel::Action action)
+    {
+        using Panel = nx::TonalPanel;
+        switch (action)
+        {
+            case Panel::selectTracks: selectToneTargets(); break;
+            case Panel::capture:
+            {
+                const nx::SpectrumFrame* frame = spectralCurrent ? &localSpectrum : nullptr;
+                const nx::Reading* measured = localCurrent ? &local : nullptr;
+                for (const auto& row : rows)
+                    if (row.spectralCurrent && displayedSpectra.count(row.identity))
+                    {
+                        frame = &row.spectrum;
+                        measured = row.current ? &row.reading : nullptr;
+                        break;
+                    }
+                if (frame && nx::spectrumEnergy(frame->before) > 1.0e-10)
+                {
+                    ++referenceRequest;
+                    referenceStats = {};
+                    if (measured)
+                    {
+                        referenceStats.valid = true;
+                        referenceStats.rms = measured->rms;
+                        referenceStats.peak = measured->peak;
+                        referenceStats.crest = std::max(0.0f, measured->peak - measured->rms);
+                        referenceStats.balance = frame->pan;
+                    }
+                    referenceType = frame == &localSpectrum && plugin.hub() ? 0 : 2;
+                    referenceLabel = referenceType == 0 ? "Mix Bus" : utf8("Captura da sessão");
+                    setTonalReference(frame->frames >= 4 ? frame->longBefore : frame->before);
+                    tonalPanel.status = utf8("Referência capturada a partir do sinal medido.");
+                }
+                else
+                    tonalPanel.status = utf8("Aguardando sinal para capturar a referência.");
+                break;
+            }
+            case Panel::import: importTonalReference(); break;
+            case Panel::suggest: suggestTone(false); break;
+            case Panel::masking: suggestTone(true); break;
+            case Panel::lowEnd: suggestTone(true, false, 1); break;
+            case Panel::vocal: suggestTone(true, false, 2); break;
+            case Panel::library: showReferenceLibrary(); break;
+            case Panel::preview:
+            case Panel::apply: finishTonal(action); break;
+            case Panel::cancel: cancelTonal(); tonalPanel.status = utf8("Sugestão descartada."); break;
+            case Panel::undo: undoTonal(); break;
+            case Panel::bypass:
+            {
+                if (analysisOnly.getToggleState())
+                    break;
+                std::lock_guard<std::mutex> lock(registry().mutex);
+                clearTonePreviewLocked();
+                tonalBypassed = !tonalBypassed;
+                for (auto* track : registry().tracks)
+                    if (track && track->session() == plugin.session() && track->eqUnlocked() && !track->tonalBus()
+                        && (plugin.hub() ? tonalTargets.count(track->identity) != 0 : track == &plugin))
+                        track->setParameter("toneBypass", tonalBypassed ? 1 : 0);
+                break;
+            }
+        }
+        updateTonalPanel();
+    }
+
+    void updateTonalPanel()
+    {
+        if (!tonalPanel.isVisible())
+            return;
+        const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
+        if (tonalPreviewOn && (!writable || tonalSession != plugin.session()))
+            cancelTonal();
+        const auto source = tonalPanel.genre.getSelectedId() == 10 && nx::spectrumEnergy(tonalReference) > 1.0e-10
+            ? utf8("Referência") : utf8("Perfil provisório");
+        tonalPanel.summary = (plugin.hub() ? juce::String(tonalTargets.size()) + " alvos"
+            : "Pista local") + " / " + juce::String(tonalPending.size()) + " EQ / " + source;
+        tonalPanel.update(!tonalPending.empty() && writable, tonalPreviewOn, !plugin.tonalHistory.empty() && writable,
+                          tonalBypassed);
+        tonalPanel.repaint();
+    }
+
+    nx::GlobalHeadroom busPlan() const
+    {
+        if (!plugin.hub() || !localCurrent)
+            return {};
+        const auto sample = nx::db(*std::max_element(local.outputLevels.peak.begin(), local.outputLevels.peak.end()));
+        const auto intersample = nx::db(*std::max_element(local.outputLevels.truePeak.begin(), local.outputLevels.truePeak.end()));
+        return nx::planGlobalHeadroom(sample, intersample, plugin.value("premasterPeak"),
+                                      plugin.value("trueCeiling"), plugin.value("outputTrim"));
+    }
+
+    void cancelSmart()
+    {
+        if (analyzing && smartAnalysing)
+        {
+            assignLearning(0);
+            analyzing = false;
+        }
+        smartAnalysing = false;
+        discard(utf8("Prévia de preparação descartada."));
+        cancelTonal();
+    }
+
+    void redoSmart()
+    {
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        clearPreview();
+        clearTonePreviewLocked();
+        unsigned restored = 0;
+        if (!plugin.redoHistory.empty())
+        {
+            auto& batch = plugin.redoHistory.back();
+            std::vector<Change> applied;
+            capturedSession = plugin.session();
+            capturedHeadroom = plugin.value("headroom");
+            batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const auto& item)
+            {
+                if (!stillApplies(item))
+                    return false;
+                auto* target = findTrack(item.identity);
+                target->setTrim(item.next);
+                target->lastAppliedTrim = item.next;
+                applied.push_back(item);
+                ++restored;
+                return true;
+            }), batch.end());
+            if (!applied.empty())
+                plugin.history.push_back(std::move(applied));
+            if (batch.empty())
+                plugin.redoHistory.pop_back();
+        }
+        if (!plugin.tonalRedo.empty())
+        {
+            auto& batch = plugin.tonalRedo.back();
+            std::vector<TonalChange> applied;
+            tonalSession = plugin.session();
+            batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const auto& item)
+            {
+                if (!canCommitTone(item) || !safeTonalOutput(item))
+                    return false;
+                findTrack(item.track)->setTone(item.after);
+                applied.push_back(item);
+                ++restored;
+                return true;
+            }), batch.end());
+            if (!applied.empty())
+                plugin.tonalHistory.push_back(std::move(applied));
+            if (batch.empty())
+                plugin.tonalRedo.pop_back();
+        }
+        if (!busRedo.empty() && plugin.volumeUnlocked())
+        {
+            const auto entry = busRedo.back();
+            if (std::abs(plugin.value("outputTrim") - entry.first) < 0.011f)
+            {
+                plugin.setParameter("outputTrim", entry.second);
+                busUndo.push_back(entry);
+                busRedo.pop_back();
+                ++restored;
+            }
+        }
+        smartStatus = juce::String(restored) + utf8(" ajustes reaplicados com as condições atuais.");
+    }
+
+    bool safeTonalOutput(const TonalChange& item) const
+    {
+        const auto* track = findTrack(item.track);
+        if (track == nullptr)
+            return false;
+        nx::Reading reading;
+        if (!track->measurement.read(reading, plugin.session()) || !reading.active())
+            return false;
+        auto gainTrim = track->value("trim");
+        for (const auto& change : pending)
+            if (change.identity == item.track)
+                gainTrim = change.next;
+        const auto inputTrue = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(), reading.inputLevels.truePeak.end()));
+        double boost = std::max(0.0, item.after.compensation);
+        for (const auto& band : item.after.bands)
+            boost += std::max(0.0, band.gain);
+        return inputTrue + gainTrim + track->value("outputTrim") + boost <= plugin.value("trueCeiling") - 0.3;
+    }
+
+    void handleSmart(nx::SmartPanel::Action action)
+    {
+        using Panel = nx::SmartPanel;
+        switch (action)
+        {
+            case Panel::analyse:
+                if (!smartPanel.gainModule.getToggleState() && !smartPanel.toneModule.getToggleState()
+                    && !smartPanel.maskModule.getToggleState())
+                    smartStatus = utf8("Selecione pelo menos um módulo.");
+                else
+                {
+                    cancelSmart();
+                    smartStatus = utf8("Reproduza o trecho e aguarde a janela. A análise não aplica ajustes.");
+                    startAnalysis(true);
+                }
+                break;
+            case Panel::preview:
+            {
+                const bool listeningBefore = listening || tonalPreviewOn;
+                if (!pending.empty() && (!listeningBefore || listening))
+                    togglePreview();
+                if (!tonalPending.empty() && (!listeningBefore || tonalPreviewOn))
+                    finishTonal(nx::TonalPanel::preview);
+                smartStatus = listening || tonalPreviewOn ? utf8("B: ajustes em prévia.") : utf8("A: ajustes já gravados.");
+                break;
+            }
+            case Panel::apply:
+            {
+                if (pending.empty() && tonalPending.empty())
+                    break;
+                bool safe;
+                {
+                    std::lock_guard<std::mutex> lock(registry().mutex);
+                    safe = std::all_of(pending.begin(), pending.end(), [this](const auto& item) { return stillApplies(item); })
+                        && std::all_of(tonalPending.begin(), tonalPending.end(),
+                            [this](const auto& item) { return canCommitTone(item) && safeTonalOutput(item); });
+                }
+                if (!safe || analysisOnly.getToggleState())
+                {
+                    smartStatus = utf8("Aplicação suspensa: os alvos, a margem ou as medições mudaram.");
+                    break;
+                }
+                if (!pending.empty())
+                    commit();
+                if (!tonalPending.empty())
+                    finishTonal(nx::TonalPanel::apply);
+                smartStatus = "Ajustes aplicados. Reproduza novamente para validar o Mix Bus.";
+                break;
+            }
+            case Panel::cancel:
+                cancelSmart();
+                smartStatus = "Propostas descartadas.";
+                break;
+            case Panel::undo:
+                if (smartPanel.toneModule.getToggleState() || smartPanel.maskModule.getToggleState())
+                    undoTonal();
+                if (smartPanel.gainModule.getToggleState())
+                    undoLast();
+                if (!busUndo.empty() && plugin.volumeUnlocked() && !analysisOnly.getToggleState())
+                {
+                    const auto entry = busUndo.back();
+                    if (std::abs(plugin.value("outputTrim") - entry.second) < 0.011f)
+                    {
+                        plugin.setParameter("outputTrim", entry.first);
+                        busRedo.push_back(entry);
+                        busUndo.pop_back();
+                    }
+                }
+                smartStatus = utf8("Desfazer executado para os módulos selecionados.");
+                break;
+            case Panel::redo:
+                if (!analysisOnly.getToggleState())
+                    redoSmart();
+                break;
+            case Panel::headroom:
+            {
+                const auto plan = busPlan();
+                const auto original = plugin.value("outputTrim");
+                if (!plan.available || !plugin.volumeUnlocked() || analysisOnly.getToggleState())
+                    smartStatus = utf8("Ajuste de saída indisponível. Confira reprodução e bloqueios.");
+                else if (std::abs(original - plan.suggested) < 0.01f)
+                    smartStatus = utf8("Saída dentro da margem medida.");
+                else
+                {
+                    plugin.setParameter("outputTrim", plan.suggested);
+                    busUndo.emplace_back(original, plugin.value("outputTrim"));
+                    busRedo.clear();
+                    smartStatus = utf8("Ganho de saída ajustado. Valide o pico no próximo trecho.");
+                }
+                break;
+            }
+        }
+        updateSmartPanel();
+    }
+
+    void updateSmartPanel()
+    {
+        if (!smartPanel.isVisible())
+            return;
+        smartPanel.layout(plugin.hub());
+        smartPanel.mode.setSelectedId(static_cast<int>(strategy()) + 1, juce::dontSendNotification);
+        const auto oldId = smartPanel.diagnosticTrack.getSelectedId();
+        bool same = smartPanel.diagnosticTrack.getNumItems() == static_cast<int>(rows.size());
+        for (int i = 0; same && i < static_cast<int>(rows.size()); ++i)
+            same = smartPanel.diagnosticTrack.getItemId(i) == static_cast<int>(rows[i].identity)
+                && smartPanel.diagnosticTrack.getItemText(i) == rows[i].name;
+        if (!same)
+        {
+            smartPanel.diagnosticTrack.clear(juce::dontSendNotification);
+            for (const auto& row : rows)
+                smartPanel.diagnosticTrack.addItem(row.name, static_cast<int>(row.identity));
+            smartPanel.diagnosticTrack.setSelectedId(oldId, juce::dontSendNotification);
+            if (smartPanel.diagnosticTrack.getSelectedId() == 0 && !rows.empty())
+                smartPanel.diagnosticTrack.setSelectedItemIndex(0, juce::dontSendNotification);
+        }
+        const auto* row = plugin.hub() ? rowById(static_cast<unsigned>(smartPanel.diagnosticTrack.getSelectedId()))
+                                     : rows.empty() ? nullptr : &rows.front();
+        juce::String text = smartStatus.isEmpty() ? status : smartStatus;
+        text += "\n\n";
+        if (row != nullptr && row->current)
+        {
+            const auto outTrue = nx::db(*std::max_element(row->reading.outputLevels.truePeak.begin(),
+                                                          row->reading.outputLevels.truePeak.end()));
+            text += row->name + "\nEntrada: " + number(row->reading.rms) + " dBFS RMS / "
+                + number(row->reading.peak) + " dBFS pico\n";
+            if (row->diagnostics.sufficient)
+                text += "Desejado: " + number(row->diagnostics.wanted) + " dB / permitido: "
+                    + number(row->diagnostics.permitted) + " dB\n";
+            text += "Aplicado: " + number(row->trim) + " dB";
+            if (row->diagnostics.sufficient)
+                text += " / estimado: " + number(row->proposed.trim) + " dB";
+            text += "\n";
+            text += utf8("Saída: ") + number(row->reading.outputPeak) + " dBFS / " + number(outTrue)
+                + " dBTP / margem: " + number(-outTrue) + " dB\n";
+            text += "Crista: " + number(std::max(0.0f, row->reading.peak - row->reading.rms)) + " dB / atividade: "
+                + number(row->reading.activity * 100) + "%\n";
+            text += row->volumeLocked || row->referenceOnly ? "Ganho bloqueado nesta pista.\n"
+                : row->diagnostics.sufficient ? utf8("Evidência: sinal ativo medido com margem verificada.\n")
+                                              : utf8("Evidência insuficiente. Aguarde mais áudio.\n");
+            if (row->spectralCurrent && row->spectrum.resonance >= 0)
+                text += utf8("Pico estreito recorrente: ") + juce::String(nx::bandFrequency(row->spectrum.resonance), 0) + " Hz\n";
+            for (const auto& item : tonalPending)
+                if (item.track == row->identity)
+                {
+                    text += item.conflictHz > 0 ? "Conflito sincronizado.\n" : utf8("Correção de envelope tonal.\n");
+                    if (std::abs(item.phaseDifference) <= 180)
+                        text += utf8("Diferença de fase no bin: ") + juce::String(item.phaseDifference, 1) + utf8("°\n");
+                    for (const auto& band : item.after.bands)
+                        if (band.gain != 0)
+                            text += juce::String(band.frequency, 0) + " Hz: " + juce::String(band.gain, 1) + " dB\n";
+                }
+        }
+        else
+            text += utf8("Sem sinal válido para esta pista.\n");
+        const auto mix = busPlan();
+        if (mix.available)
+            text += "\nMix Bus: " + number(mix.sample) + " dBFS / " + number(mix.truePeak) + " dBTP"
+                + utf8("\nSaída proposta: ") + number(mix.suggested) + " dB";
+        if (referenceStats.valid)
+        {
+            text += "\nRef. " + referenceLabel + " / " + juce::String(referenceStats.rms, 1)
+                + " dBFS RMS / pico " + juce::String(referenceStats.peak, 1)
+                + "\nCrista: " + juce::String(referenceStats.crest, 1) + " dB / L/R "
+                + juce::String(referenceStats.balance, 2);
+            if (referenceStats.duration > 0)
+                text += "\n" + juce::String(referenceStats.loudness, 1) + " LUFS / "
+                    + utf8("correlação ") + juce::String(referenceStats.correlation, 2);
+        }
+        smartPanel.report(text);
+        smartPanel.update(analyzing, !pending.empty() || !tonalPending.empty(), listening || tonalPreviewOn,
+            !plugin.history.empty() || !plugin.tonalHistory.empty() || !busUndo.empty(),
+            !plugin.redoHistory.empty() || !plugin.tonalRedo.empty() || !busRedo.empty(),
+            !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f);
+    }
+
+    void showSpectrumOptions()
+    {
+        juce::PopupMenu menu;
+        menu.addItem(1, utf8("Zoom 20 Hz – 20 kHz"));
+        menu.addItem(2, utf8("Suavizar curva"), true, smoothSpectrum);
+        const std::array<int, 4> windows {0, 300, 1000, 3000};
+        for (std::size_t i = 0; i < windows.size(); ++i)
+            menu.addItem(static_cast<int>(i) + 3, utf8("Média ") + juce::String(windows[i]) + " ms",
+                         true, averageMs == windows[i]);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(spectrumOptions),
+            [self = juce::Component::SafePointer<Editor>(this), windows](int id)
+            {
+                if (self == nullptr)
+                    return;
+                if (id == 1)
+                {
+                    self->graphStart = 0;
+                    self->graphSpan = 96;
+                }
+                else if (id == 2)
+                    self->smoothSpectrum = !self->smoothSpectrum;
+                else if (id >= 3 && id <= 6)
+                {
+                    self->averageMs = windows[static_cast<std::size_t>(id - 3)];
+                    self->configureSpectrum();
+                }
+                self->repaint();
+            });
+    }
+
     void drawSpectrum(juce::Graphics& g) const
     {
-        const juce::Rectangle<float> plot(62, 194, 612, 163);
+        const auto plot = plotBounds();
+        const bool norm = normalise.getToggleState();
+        const auto bandX = [&](double band)
+        {
+            return plot.getX() + plot.getWidth() * static_cast<float>((band - graphStart) / graphSpan);
+        };
+        const auto frequencyX = [&](double hz) { return bandX(std::log(hz / 20) * 96 / std::log(1000.0)); };
+        const auto dbY = [&](double db)
+        {
+            return plot.getY() + plot.getHeight() * static_cast<float>(std::clamp(-db / 84.0, 0.0, 1.0));
+        };
         g.setColour(juce::Colour(0x9c080f17));
         g.fillRect(plot);
-        const auto xFor = [&](float hz) { return plot.getX() + plot.getWidth() * std::log10(hz / 20.0f) / 3.0f; };
-        for (int decade = 0; decade < 3; ++decade)
-            for (int division = 1; division < 10; ++division)
-            {
-                g.setColour(juce::Colour(division == 1 ? 0xff344959 : 0xff23313e));
-                const int x = juce::roundToInt(xFor(20.0f * division * std::pow(10.0f, decade)));
-                g.drawVerticalLine(x, plot.getY(), plot.getBottom());
-            }
         for (int i = 0; i <= 4; ++i)
         {
-            const auto y = juce::roundToInt(plot.getY() + plot.getHeight() * i / 4.0f);
+            const auto y = juce::roundToInt(dbY(-21 * i));
             g.setColour(juce::Colour(0xff344959));
             g.drawHorizontalLine(y, plot.getX(), plot.getRight());
-            label(g, juce::String(-20 * i), 27, y - 8, 29, 16, 11);
+            label(g, juce::String(-21 * i), 25, y - 8, 31, 16, 11);
         }
-        const auto hasSpectrum = [](const nx::Reading& reading)
+        for (const int hz : {20, 30, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000})
         {
-            return std::any_of(reading.power.begin(), reading.power.end(),
-                               [](float power) { return power > 1.0e-8f; });
-        };
-        const auto trace = [&](const nx::Reading& reading, juce::Colour color, bool secondary)
-        {
-            std::array<float, nx::bands> y {}, slope {};
-            const float pitch = plot.getWidth() / nx::bands;
-            const float firstX = plot.getX() + pitch * 0.5f;
-            const float lastX = firstX + pitch * (nx::bands - 1);
-            for (int i = 0; i < nx::bands; ++i)
+            const auto x = juce::roundToInt(frequencyX(hz));
+            if (x >= plot.getX() - 1 && x <= plot.getRight() + 1)
             {
-                const auto left = reading.power[std::max(0, i - 1)];
-                const auto right = reading.power[std::min(nx::bands - 1, i + 1)];
-                const auto power = 0.80f * reading.power[i] + 0.10f * (left + right);
-                const auto decibels = nx::db(std::sqrt(power));
-                y[i] = plot.getY() + plot.getHeight() * std::clamp(-decibels / 80.0f, 0.0f, 1.0f);
-            }
-            for (int i = 1; i < nx::bands - 1; ++i)
-            {
-                const auto left = y[i] - y[i - 1], right = y[i + 1] - y[i];
-                // A bounded slope keeps each segment within its two measured endpoints.
-                if (left * right > 0)
-                    slope[i] = (2 * left * right) / (left + right);
-            }
-            juce::Path curve;
-            curve.startNewSubPath(firstX, y.front());
-            for (int i = 0; i < nx::bands - 1; ++i)
-            {
-                const auto x = firstX + i * pitch;
-                curve.cubicTo(x + pitch / 3.0f, y[i] + slope[i] / 3.0f,
-                              x + 2.0f * pitch / 3.0f, y[i + 1] - slope[i + 1] / 3.0f,
-                              x + pitch, y[i + 1]);
-            }
-            auto fill = curve;
-            fill.lineTo(lastX, plot.getBottom());
-            fill.lineTo(firstX, plot.getBottom());
-            fill.closeSubPath();
-            g.setGradientFill({color.withAlpha(secondary ? 0.08f : 0.33f), plot.getX(), plot.getY() + 40.0f,
-                               color.withAlpha(secondary ? 0.006f : 0.025f), plot.getX(), plot.getBottom(), false});
-            g.fillPath(fill);
-            if (!secondary)
-            {
-                g.setColour(color.withAlpha(0.16f));
-                g.strokePath(curve, juce::PathStrokeType(5));
-            }
-            g.setColour(color.withAlpha(secondary ? 0.64f : 1.0f));
-            g.strokePath(curve, juce::PathStrokeType(secondary ? 1.1f : 1.65f));
-        };
-        bool drewTrace = false;
-        const auto* principal = focusRow >= 0 ? &rows[static_cast<std::size_t>(focusRow)] : nullptr;
-        if (plugin.hub())
-            for (const auto& row : rows)
-                if (&row != principal && row.current && hasSpectrum(row.reading))
+                g.setColour(juce::Colour(0xff344959));
+                g.drawVerticalLine(x, plot.getY(), plot.getBottom());
+                if (graphSpan < 75 || hz == 20 || hz == 100 || hz == 500 || hz == 2000 || hz == 10000 || hz == 20000)
                 {
-                    trace(row.reading, spectrumColour(row), true);
-                    drewTrace = true;
+                    const auto text = hz < 1000 ? juce::String(hz) + " Hz" : juce::String(hz / 1000) + " kHz";
+                    label(g, text, std::clamp(x - 12, 58, 639), 354, 51, 18, 10);
                 }
-
-        if (localCurrent && hasSpectrum(local))
-        {
-            const auto mixColor = juce::Colour(plugin.hub() ? 0xffa9bed3 : cyan);
-            trace(local, mixColor, drewTrace);
-            drewTrace = true;
-            label(g, plugin.hub() ? "Mix bus" : "Entrada", 581, 161, 90, 24, 12, mixColor.getARGB());
+            }
         }
-        if (principal != nullptr && hasSpectrum(principal->reading))
-        {
-            trace(principal->reading, spectrumColour(*principal), false);
-            drewTrace = true;
-            label(g, principal->name + " (Principal)", 385, 161, 181, 24, 12, cyan);
-        }
-        if (!drewTrace)
-            label(g, "Aguardando sinal", 309, 257, 168, 20, 14, ink);
+        const auto& traces = spectralFreeze.getToggleState() ? frozenRows : rows;
+        const auto& mix = spectralFreeze.getToggleState() ? frozenSpectrum : localSpectrum;
+        const bool mixReady = spectralFreeze.getToggleState() ? frozenCurrent : spectralCurrent;
+        const auto view = spectrumMode.getSelectedId();
+        const nx::Spectrum* cursorPower = nullptr;
+        const TrackRow* compared[2] {};
+        int count = 0;
+        for (const auto& row : traces)
+            if (displayedSpectra.count(row.identity) != 0 && count < 2)
+                compared[count++] = &row;
 
-        constexpr std::array<float, 7> ticks {20, 60, 200, 600, 2000, 6000, 20000};
-        const std::array<juce::String, 7> captions {"20 Hz", "60", "200", "600", "2 kHz", "6 kHz", "20 kHz"};
-        for (std::size_t i = 0; i < ticks.size(); ++i)
-            label(g, captions[i], std::min(636, juce::roundToInt(xFor(ticks[i])) - 10), 360, 57, 20, 11);
+        auto trace = [&](const nx::Spectrum& power, juce::Colour color, bool translucent)
+        {
+            if (nx::spectrumEnergy(power) <= 1.0e-10)
+                return;
+            cursorPower = &power;
+            const double normal = norm ? *std::max_element(power.begin(), power.end()) : 1.0;
+            std::array<float, nx::tonalBands> y {}, slope {};
+            for (int i = 0; i < nx::tonalBands; ++i)
+            {
+                const auto value = smoothSpectrum
+                    ? 0.15 * power[std::max(0, i - 1)] + 0.70 * power[i] + 0.15 * power[std::min(nx::tonalBands - 1, i + 1)]
+                    : power[i];
+                y[i] = dbY(nx::powerDb(value / normal));
+            }
+            for (int i = 1; smoothSpectrum && i < nx::tonalBands - 1; ++i)
+            {
+                const auto a = y[i] - y[i - 1], b = y[i + 1] - y[i];
+                if (a * b > 0)
+                    slope[i] = (2 * a * b) / (a + b);
+            }
+            juce::Path path;
+            path.startNewSubPath(bandX(0.5), y[0]);
+            for (int i = 0; i < nx::tonalBands - 1; ++i)
+                if (smoothSpectrum)
+                    path.cubicTo(bandX(i + 0.8333), y[i] + slope[i] / 3, bandX(i + 1.1667),
+                                 y[i + 1] - slope[i + 1] / 3, bandX(i + 1.5), y[i + 1]);
+                else
+                    path.lineTo(bandX(i + 1.5), y[i + 1]);
+            auto fill = path;
+            fill.lineTo(bandX(nx::tonalBands - 0.5), plot.getBottom());
+            fill.lineTo(bandX(0.5), plot.getBottom());
+            fill.closeSubPath();
+            g.setGradientFill({color.withAlpha(translucent ? 0.08f : 0.30f), plot.getX(), plot.getY(), color.withAlpha(0.01f),
+                               plot.getX(), plot.getBottom(), false});
+            g.fillPath(fill);
+            g.setColour(color.withAlpha(translucent ? 0.68f : 1.0f));
+            g.strokePath(path, juce::PathStrokeType(translucent ? 1.2f : 1.8f));
+        };
+        juce::String legend;
+        {
+            juce::Graphics::ScopedSaveState state(g);
+            g.reduceClipRegion(plot.getSmallestIntegerContainer());
+            const auto conflict = pairConflict(compared[0], compared[1]);
+            if (view == 4 && conflict.band >= 0)
+            {
+                g.setColour(juce::Colour(0x36ffb64a));
+                g.fillRect(juce::Rectangle<float>(bandX(conflict.band - 3), plot.getY(),
+                    bandX(conflict.band + 4) - bandX(conflict.band - 3), plot.getHeight()));
+            }
+            if (view == 1 && mixReady)
+            {
+                trace(mix.after, juce::Colour(cyan), false);
+                legend = plugin.hub() ? "Mix bus" : "Track";
+            }
+            if (view == 2 || view == 3 || view == 4)
+            {
+                int drawn = 0;
+                for (const auto& row : traces)
+                    if (row.spectralCurrent && displayedSpectra.count(row.identity) != 0)
+                    {
+                        trace(row.spectrum.before, spectrumColour(row), view != 2);
+                        legend += (legend.isEmpty() ? "" : " / ") + row.name;
+                        if (++drawn == (view == 2 ? 1 : view == 4 ? 2 : 64))
+                            break;
+                    }
+            }
+            if (view == 5 || view == 6)
+            {
+                const auto* source = compared[0] != nullptr && compared[0]->spectralCurrent ? &compared[0]->spectrum
+                    : mixReady ? &mix : nullptr;
+                if (source != nullptr)
+                {
+                    trace(source->before, juce::Colour(cyan), false);
+                    if (view == 6)
+                        trace(source->after, juce::Colour(0xffe8a05e), true);
+                }
+                if (view == 5)
+                    trace(tonalReference, juce::Colour(0xffd099f8), true);
+                legend = view == 5 ? utf8("Sinal / Referência") : "Antes / Depois";
+            }
+            if (plot.contains(graphCursor))
+            {
+                g.setColour(juce::Colour(0x9ce1f5ff));
+                g.drawVerticalLine(juce::roundToInt(graphCursor.x), plot.getY(), plot.getBottom());
+                g.drawHorizontalLine(juce::roundToInt(graphCursor.y), plot.getX(), plot.getRight());
+            }
+        }
+        if (!cursorPower && view != 7)
+            label(g, view >= 2 && view <= 4 ? "Marque as pistas na coluna Ver" : "Aguardando sinal",
+                  276, 257, 248, 20, 13, ink);
+        if (plot.contains(graphCursor))
+        {
+            const double band = graphStart + (graphCursor.x - plot.getX()) / plot.getWidth() * graphSpan;
+            const auto hz = nx::bandFrequency(band - 0.5);
+            const double normPower = cursorPower && norm ? *std::max_element(cursorPower->begin(), cursorPower->end()) : 1.0;
+            const double level = cursorPower ? nx::powerDb((*cursorPower)[std::clamp(static_cast<int>(band), 0, 95)] / normPower)
+                : -84.0 * (graphCursor.y - plot.getY()) / plot.getHeight();
+            legend = juce::String(hz, 1) + " Hz   " + juce::String(level, 1) + (norm ? " dB rel." : " dBFS");
+        }
+        label(g, legend, 31, 374, 645, 16, 11, muted);
     }
 
     void drawRows(juce::Graphics& g)
@@ -1064,7 +2472,11 @@ private:
         const auto selected = static_cast<unsigned>(pick.getSelectedId());
         label(g, "Pista", 34, 428, 130, 16, 11);
         label(g, "RMS dBFS", 248, 428, 68, 16, 11);
+        if (plugin.hub())
+            label(g, "Ver", 216, 428, 25, 16, 11, cyan);
         label(g, "Pico dBFS", 327, 428, 68, 16, 11);
+        if (plugin.hub() && tonalPanel.isVisible())
+            label(g, "EQ", 386, 428, 23, 16, 11, cyan);
         label(g, "Sug. dB", 413, 428, 60, 16, 11);
         label(g, "Trim dB", 488, 428, 62, 16, 11);
         label(g, "Sinal / margem", 557, 428, 92, 16, 11);
@@ -1097,7 +2509,7 @@ private:
             if (!plugin.hub() && row.role == nx::focus)
                 badge(g, "Foco", 124, top + 3, 43, cyan);
             const bool signal = row.current && row.reading.peak > -90;
-            drawSegments(g, {183, y + 9, 51, 10}, signal ? row.reading.rms : nx::floorDb, 10, false);
+            drawSegments(g, {183, y + 9, plugin.hub() ? 26.0f : 51.0f, 10}, signal ? row.reading.rms : nx::floorDb, 10, false);
             const auto dash = utf8("—");
             label(g, signal ? number(row.reading.rms) : dash, 248, top, 75, 28, 13);
             label(g, signal ? number(row.reading.peak) : dash, 327, top, 75, 28, 13);
@@ -1128,7 +2540,7 @@ private:
 
     bool canSuggest(const TrackRow& row) const
     {
-        return row.current && row.reading.active() && (mode() == nx::GainMode::calibration || focusRow >= 0);
+        return !row.volumeLocked && !row.referenceOnly && row.current && row.reading.active() && (!needsAnchor() || focusRow >= 0);
     }
 
     void timerCallback() override
@@ -1147,6 +2559,7 @@ private:
         reference.setBounds(isHub ? 474 : 95, isHub ? 75 : 113, 119, 27);
         headroom.setBounds(isHub ? 671 : 304, isHub ? 75 : 113, 118, 27);
         trackLimit.setVisible(!isHub);
+        tonalExclude.setVisible(!isHub);
         pick.setVisible(isHub && scope.getSelectedId() == 1);
         group.setVisible(!isHub || scope.getSelectedId() == 2);
         group.setBounds(isHub ? 222 : 459, isHub ? 114 : 75, 125, 26);
@@ -1157,6 +2570,7 @@ private:
         trim.setVisible(!isHub);
 
         localCurrent = plugin.measurement.read(local, plugin.session());
+        spectralCurrent = plugin.spectrum.read(localSpectrum, plugin.session());
         rows.clear();
         focusRow = otherRow = -1;
         auto append = [&](Processor& track)
@@ -1164,10 +2578,26 @@ private:
             TrackRow row {track.identity, track.group(), track.musicalRole(), track.value("trim"), false, {}, {}, 0, track.displayName()};
             row.current = track.eligible(plugin.session())
                 && track.measurement.read(row.reading, plugin.session(), &row.timestamp);
+            if (isHub)
+                track.spectrum.configure(std::max(0, fftChoice.getSelectedId() - 1), averageMs);
+            row.spectralCurrent = row.current && track.spectrum.read(row.spectrum, plugin.session());
+            row.tonalBus = track.tonalBus();
+            row.volumeLocked = track.value("volumeLock") > 0.5f;
+            row.eqLocked = track.value("eqLock") > 0.5f;
+            row.referenceOnly = track.value("referenceOnly") > 0.5f;
+            row.priority = static_cast<int>(track.value("priority"));
+            row.function = static_cast<nx::Function>(static_cast<int>(track.value("function")));
+            if (row.spectralCurrent)
+            {
+                for (int i = 0; i < nx::tonalBands; ++i)
+                    row.reading.power[i / 4] += row.spectrum.instant[i];
+                row.reading.position = row.spectrum.end;
+            }
             row.peakProfile = track.value("instrument") > 0 ? 0 : static_cast<int>(track.value("peakReference"));
             row.instrument = track.instrument();
             row.customPeak = track.value("targetPeak");
             row.outputGainDb = track.value("outputTrim");
+            row.toneBoost = track.tonalBoost();
             row.adjusted = track.lastAppliedTrim && std::abs(*track.lastAppliedTrim - row.trim) <= 0.011f;
             rows.push_back(row);
         };
@@ -1189,6 +2619,8 @@ private:
         }
         updateSuggestions();
         updatePrincipalButtons();
+        updateTonalPanel();
+        updateSmartPanel();
 
         finishAnalysis();
         updateButtons();
@@ -1233,12 +2665,21 @@ private:
         for (int i = 0; i < visibleRows; ++i)
         {
             auto& button = principalButtons[static_cast<std::size_t>(i)];
+            auto& checkbox = spectrumButtons[static_cast<std::size_t>(i)];
+            auto& target = tonalButtons[static_cast<std::size_t>(i)];
             const auto index = static_cast<std::size_t>(firstRow + i);
             const bool present = plugin.hub() && index < rows.size();
             button.setVisible(present);
+            checkbox.setVisible(present);
+            target.setVisible(present && tonalPanel.isVisible());
             if (present)
             {
                 const auto& row = rows[index];
+                target.setTitle("Alvo de EQ: " + row.name);
+                target.setEnabled(!row.tonalBus && !row.eqLocked && !row.referenceOnly);
+                target.setToggleState(tonalTargets.count(row.identity) != 0, juce::dontSendNotification);
+                checkbox.setTitle(utf8("Mostrar espectro de ") + row.name);
+                checkbox.setToggleState(displayedSpectra.count(row.identity) != 0, juce::dontSendNotification);
                 button.setTitle("Marcar " + row.name + " como Foco");
                 button.setTooltip("Usar " + row.name + " como pista de foco e principal");
                 button.setToggleState(row.role == nx::focus, juce::dontSendNotification);
@@ -1264,6 +2705,8 @@ private:
                     && track->session() == sessionId && track->role() == nx::focus)
                     track->setParameter("role", nx::automatic);
             selected->setParameter("role", nx::focus);
+            if (strategy() != nx::GainStrategy::hybrid)
+                plugin.setParameter("smartStrategy", 0);
             plugin.setParameter("operation", 1);
         }
         if (analyzing)
@@ -1287,20 +2730,21 @@ private:
         undo.setEnabled(writable && !analyzing && !plugin.history.empty());
     }
 
-    std::array<float, 9> analysisSettings() const
+    std::array<float, 10> analysisSettings() const
     {
         return {plugin.value("instance"), plugin.value("session"), plugin.value("operation"), plugin.value("reference"),
                 plugin.value("limit"), plugin.value("headroom"), plugin.value("learnTime"),
-                plugin.value("sensitivity"), plugin.value("trueCeiling")};
+                plugin.value("sensitivity"), plugin.value("trueCeiling"), plugin.value("smartStrategy")};
     }
 
-    void startAnalysis()
+    void startAnalysis(bool previewOnly = false)
     {
-        if (freeze.getToggleState() || analysisOnly.getToggleState() || analyzing || plugin.value("bypass") > 0.5f)
+        if (freeze.getToggleState() || (!previewOnly && analysisOnly.getToggleState()) || analyzing || plugin.value("bypass") > 0.5f)
             return;
         discard(plugin.hub()
             ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
             : utf8("ANALYZER  /  Mantenha a pista em reprodução. O trim local será ajustado."));
+        smartAnalysing = previewOnly;
         requestedSettings = analysisSettings();
         {
             std::lock_guard<std::mutex> lock(registry().mutex);
@@ -1333,9 +2777,19 @@ private:
             return;
 
         analyzing = false;
-        prepareChanges(true);
+        if (!smartAnalysing || smartPanel.gainModule.getToggleState())
+            prepareChanges(true);
         assignLearning(0);
-        if (!pending.empty())
+        if (smartAnalysing)
+        {
+            if (smartPanel.toneModule.getToggleState())
+                suggestTone(false);
+            if (smartPanel.maskModule.getToggleState())
+                suggestTone(true, smartPanel.toneModule.getToggleState());
+            smartAnalysing = false;
+            status = utf8("Análise concluída. Revise as propostas antes de aplicar.");
+        }
+        else if (!pending.empty())
             commit();
     }
 
@@ -1359,10 +2813,20 @@ private:
         for (int i = 0; i < static_cast<int>(rows.size()); ++i)
         {
             const auto& row = rows[static_cast<std::size_t>(i)];
-            if (row.role == nx::focus && row.current && row.reading.active())
+            if (row.role == nx::focus && !row.referenceOnly && row.current && row.reading.active())
             {
                 focusRow = i;
                 break;
+            }
+        }
+        if (focusRow < 0 && strategy() == nx::GainStrategy::hybrid)
+        {
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+            {
+                const auto& row = rows[static_cast<std::size_t>(i)];
+                if (!row.referenceOnly && row.current && row.reading.active()
+                    && (focusRow < 0 || row.priority > rows[static_cast<std::size_t>(focusRow)].priority))
+                    focusRow = i;
             }
         }
         nx::Overlap strongest;
@@ -1400,28 +2864,41 @@ private:
     void updateSuggestions()
     {
         const auto focusAnchor = focusRow >= 0
-            ? rows[static_cast<std::size_t>(focusRow)].reading.rms + rows[static_cast<std::size_t>(focusRow)].trim : 0.0f;
-        const auto anchor = mode() == nx::GainMode::calibration ? plugin.value("reference") : focusAnchor;
+            ? rows[static_cast<std::size_t>(focusRow)].reading.rms + rows[static_cast<std::size_t>(focusRow)].trim
+            : plugin.value("reference");
+        const auto anchor = needsAnchor() ? focusAnchor : plugin.value("reference");
         for (auto& row : rows)
             if (canSuggest(row))
-                row.proposed = suggest(row, anchor, false);
-
+            {
+                row.diagnostics = diagnoseGain(row, anchor, false);
+                row.proposed = row.diagnostics.suggestion;
+            }
     }
 
-    nx::GainSuggestion suggest(const TrackRow& row, float anchor, bool learned) const
+    nx::SmartGainResult diagnoseGain(const TrackRow& row, float anchor, bool learned) const
     {
         auto reading = row.reading;
         if (learned && reading.learnedPeak > nx::floorDb)
             reading.peak = reading.learnedPeak;
+        if (strategy() == nx::GainStrategy::hybrid)
+        {
+            if (learned && reading.learnedActiveWindows >= 4 && reading.learnedEnergy > nx::floorDb)
+                reading.rms = 0.5f * (reading.rms + reading.learnedEnergy);
+            else if (reading.activity >= 0.15f && reading.activeRms > reading.rms)
+                reading.rms = 0.5f * (reading.rms + reading.activeRms);
+        }
         const float liveTrue = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
                                                        reading.inputLevels.truePeak.end()));
         const float maximum = std::max(liveTrue, learned ? reading.learnedCeiling : liveTrue);
-        const float headroomDb = std::max(plugin.value("headroom"), -plugin.value("trueCeiling") + row.outputGainDb);
+        const float headroomDb = std::max(plugin.value("headroom"), -plugin.value("trueCeiling") + row.outputGainDb + row.toneBoost);
         float target = row.customPeak;
         if (target > 0 && row.peakProfile == 0 && row.instrument > 0)
             target = nx::presets[row.instrument - 1].target;
-        return nx::suggestTrim(reading, mode(), anchor, row.role, plugin.value("limit"),
-                               headroomDb, row.peakProfile, target, maximum);
+        const auto categoryId = row.instrument > 0 ? nx::presets[row.instrument - 1].category : 2;
+        const auto chosenRole = strategy() == nx::GainStrategy::hybrid && focusRow >= 0
+                && rows[static_cast<std::size_t>(focusRow)].identity == row.identity ? nx::focus : row.role;
+        return nx::smartGain({reading, strategy(), chosenRole, row.function, categoryId, row.priority,
+                              row.peakProfile, row.trim, target, anchor, plugin.value("limit"), headroomDb, maximum});
     }
 
     void capture()
@@ -1447,16 +2924,16 @@ private:
         const auto usable = [&](const TrackRow& row)
         {
             return fresh(row) && canSuggest(row) && (!automatic
-                || (row.reading.learningId == activeLearning
+                || (row.reading.learningId == activeLearning && row.reading.learnedActiveWindows >= 4
                     && !(row.instrument > 0 && nx::presets[row.instrument - 1].category == 7)));
         };
-        if (mode() == nx::GainMode::musical
+        if (needsAnchor()
             && (focusRow < 0 || !fresh(rows[static_cast<std::size_t>(focusRow)])))
         {
             status = "Escolha uma pista de Foco e reproduza um trecho ativo.";
             return;
         }
-        const auto anchor = mode() == nx::GainMode::calibration ? plugin.value("reference")
+        const auto anchor = !needsAnchor() ? plugin.value("reference")
             : rows[static_cast<std::size_t>(focusRow)].reading.rms + rows[static_cast<std::size_t>(focusRow)].trim;
         int skipped = 0;
         capturedSession = plugin.session();
@@ -1468,7 +2945,7 @@ private:
             return scopeId == 1 ? row.identity == static_cast<unsigned>(pick.getSelectedId())
                 : scopeId == 2 ? row.group == plugin.group() : true;
         };
-        const bool commonCalibration = !automatic && capturedHub && mode() == nx::GainMode::calibration && scopeId != 1;
+        const bool commonCalibration = !automatic && capturedHub && strategy() == nx::GainStrategy::technical && scopeId != 1;
         nx::GroupCalibration calibration(plugin.value("limit"), capturedHeadroom);
         if (commonCalibration)
         {
@@ -1486,7 +2963,7 @@ private:
         {
             if (!inScope(row))
                 continue;
-            const auto proposedGain = usable(row) ? suggest(row, anchor, automatic) : nx::GainSuggestion{};
+            const auto proposedGain = usable(row) ? diagnoseGain(row, anchor, automatic).suggestion : nx::GainSuggestion{};
             if (!usable(row) || (!commonCalibration && proposedGain.headroomUnmet))
             {
                 ++skipped;
@@ -1521,7 +2998,7 @@ private:
     bool stillApplies(const Change& change) const
     {
         auto* track = findTrack(change.identity);
-        if (track == nullptr || !track->eligible(capturedSession)
+        if (track == nullptr || !track->eligible(capturedSession) || !track->volumeUnlocked()
             || std::abs(track->value("trim") - change.previous) > 0.011f
             || (track->previewOwner != 0 && track->previewOwner != plugin.identity))
             return false;
@@ -1531,7 +3008,7 @@ private:
         const auto truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
                                                        reading.inputLevels.truePeak.end()));
         return change.next + reading.peak <= -capturedHeadroom + 0.001f
-            && change.next + track->value("outputTrim") + truePeak <= plugin.value("trueCeiling") + 0.001f;
+            && change.next + track->value("outputTrim") + truePeak + track->tonalBoost() <= plugin.value("trueCeiling") + 0.001f;
     }
 
     void clearPreview()
@@ -1606,6 +3083,7 @@ private:
         }
         clearPreview();
         const auto count = pending.size();
+        plugin.redoHistory.clear();
         plugin.history.push_back(std::move(pending));
         pending.clear();
         status = juce::String(count) + " trims internos aplicados. Desfazer restaura os valores anteriores.";
@@ -1622,17 +3100,21 @@ private:
         pending.clear();
         auto& batch = plugin.history.back();
         const auto oldSize = batch.size();
-        batch.erase(std::remove_if(batch.begin(), batch.end(), [](const auto& change)
+        std::vector<Change> reverted;
+        batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const auto& change)
         {
             auto* track = findTrack(change.identity);
-            if (track == nullptr || track->hub() || track->previewOwner != 0
+            if (track == nullptr || track->hub() || !track->volumeUnlocked() || track->previewOwner != 0
                 || std::abs(track->value("trim") - change.next) > 0.011f)
                 return false;
             track->setTrim(change.previous);
             track->lastAppliedTrim = change.previousApplied;
+            reverted.push_back(change);
             return true;
         }), batch.end());
         const auto remaining = batch.size();
+        if (!reverted.empty())
+            plugin.redoHistory.push_back(std::move(reverted));
         if (batch.empty())
             plugin.history.pop_back();
         status = juce::String(oldSize - remaining) + " trims restaurados."
@@ -1644,21 +3126,48 @@ private:
     int firstRow = 0;
     Processor& plugin;
     GlassLook glass;
+    juce::TextButton smartToggle;
+    nx::SmartPanel smartPanel {[this](nx::SmartPanel::Action action) { handleSmart(action); }};
+    std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> smartAttachments;
+    bool smartAnalysing = false;
+    std::vector<unsigned> reportTracks;
+    std::vector<std::pair<float, float>> busUndo, busRedo;
+    juce::String smartStatus;
+    juce::ComboBox spectrumMode, fftChoice;
+    juce::TextButton normalise, spectralFreeze, spectrumOptions, tonalToggle;
+    std::array<juce::ToggleButton, visibleRows> spectrumButtons, tonalButtons;
+    nx::TonalPanel tonalPanel {[this](nx::TonalPanel::Action action) { handleTonal(action); }};
+    std::set<unsigned> displayedSpectra, tonalTargets;
+    std::unique_ptr<juce::FileChooser> tonalChooser;
+    std::vector<TonalChange> tonalPending;
+    int tonalSession = 0;
+    bool tonalPreviewOn = false, tonalBypassed = false;
+    nx::Spectrum tonalReference {};
+    nx::ReferenceAudio referenceStats;
+    juce::String referenceLabel;
+    int referenceType = 0;
+    unsigned referenceRequest = 0;
+    nx::SpectrumFrame localSpectrum, frozenSpectrum;
+    std::vector<TrackRow> frozenRows;
+    bool spectralCurrent = false, frozenCurrent = false, smoothSpectrum = true;
+    double graphStart = 0, graphSpan = 96;
+    int averageMs = 300;
+    juce::Point<float> graphCursor {-1, -1};
     juce::ComboBox instance, role, operation, scope, pick, support, peakReference, category, instruments;
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
-    juce::ToggleButton bypass, freeze;
+    juce::ToggleButton bypass, freeze, tonalExclude;
     juce::TextButton manualAnalyze, autoGain, resetHold;
     juce::Slider outputTrim, targetPeak, learnTime, sensitivity, trueCeiling;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment, freezeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment, freezeAttachment, tonalExcludeAttachment;
     std::vector<TrackRow> rows;
     std::vector<Change> pending;
     nx::Reading local;
     bool localCurrent = false, listening = false, analyzing = false;
-    std::array<float, 9> requestedSettings {};
+    std::array<float, 10> requestedSettings {};
     juce::uint32 analysisStarted = 0;
     unsigned activeLearning = 0;
     int focusRow = -1, otherRow = -1, capturedSession = 0;
