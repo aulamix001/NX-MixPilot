@@ -20,6 +20,14 @@ struct SpectrumFrame
     juce::uint32 updated = 0;
 };
 
+struct TonalCapture
+{
+    Spectrum power {};
+    double seconds = 0;
+    unsigned token = 0, frames = 0;
+    int rate = 0;
+};
+
 class SpectralWorker final : private juce::TimeSliceClient
 {
 public:
@@ -59,6 +67,26 @@ public:
     {
         configuration.store((std::clamp(averagingMs, 0, 4000) << 2) | std::clamp(fftIndex, 0, 2),
                             std::memory_order_relaxed);
+    }
+
+    void capture(unsigned token, unsigned seconds)
+    {
+        captureJob.store((static_cast<std::uint64_t>(token) << 8) | seconds);
+    }
+
+    bool isCapturing(unsigned token) const { return (captureJob.load() >> 8) == token; }
+
+    void stopCapture(unsigned token)
+    {
+        auto expected = captureJob.load();
+        if ((expected >> 8) == token)
+            captureJob.compare_exchange_strong(expected, 0);
+    }
+
+    TonalCapture captureProgress(unsigned token) const
+    {
+        std::lock_guard<std::mutex> guard(frameLock);
+        return captured.token == token ? captured : TonalCapture{};
     }
 
     bool read(SpectrumFrame& result, int session) const
@@ -212,6 +240,22 @@ private:
         const auto retain = seconds > 0 ? std::exp(-size / (sample.rate * seconds)) : 0.0;
         const bool inputActive = spectrumEnergy(frame.instant) >= 1.0e-10;
         const bool outputActive = spectrumEnergy(output) >= 1.0e-10;
+        const auto job = captureJob.load();
+        const auto token = static_cast<unsigned>(job >> 8);
+        if (captureWork.token != token || captureWork.rate != sample.rate || captureSession != sample.session)
+        {
+            captureWork = {};
+            captureWork.token = token;
+            captureWork.rate = sample.rate;
+            captureSession = sample.session;
+        }
+        if (token != 0 && captureWork.seconds < (job & 255u) && spectrumEnergy(frame.instant) >= 1.0e-7)
+        {
+            ++captureWork.frames;
+            captureWork.seconds += size / static_cast<double>(sample.rate);
+            for (int i = 0; i < tonalBands; ++i)
+                captureWork.power[i] += (frame.instant[i] - captureWork.power[i]) / captureWork.frames;
+        }
         auto average = [retain](Spectrum& stored, const Spectrum& fresh, bool wasActive, bool active)
         {
             if (!active)
@@ -270,6 +314,7 @@ private:
         frame.updated = juce::Time::getMillisecondCounter();
         std::lock_guard<std::mutex> guard(frameLock);
         latest = frame;
+        captured = captureWork;
     }
 
     std::array<Sample, queueSize> queue {};
@@ -288,5 +333,8 @@ private:
     bool hasInput = false, hasOutput = false, outputDiffers = false;
     mutable std::mutex frameLock;
     SpectrumFrame latest;
+    std::atomic<std::uint64_t> captureJob {0};
+    TonalCapture captureWork, captured;
+    int captureSession = 0;
 };
 }

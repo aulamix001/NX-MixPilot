@@ -67,6 +67,41 @@ int main()
     require(std::sqrt(harmonicPower / std::norm(projected[0])) < 1.0e-8,
             "Steady-state filter THD exceeded the test threshold.");
 
+    for (const double sampleRate : {44100, 48000, 88200, 96000, 192000})
+    {
+        nx::BellFilter tested;
+        const nx::Bell setting {880, 4, 1.4};
+        tested.prepare(setting, sampleRate);
+        require(near(nx::powerDb(tested.response(setting.frequency, sampleRate)), setting.gain, 1e-7),
+               "EQ response must remain accurate at every supported validation rate.");
+        double residual = 0;
+        for (int i = 0; i < static_cast<int>(sampleRate / 2); ++i)
+        {
+            const auto output = tested.process(i == 0 ? 1.0 : 0.0);
+            require(std::isfinite(output), "EQ impulse response must remain stable.");
+            if (i > sampleRate / 4)
+                residual = std::max(residual, std::abs(output));
+        }
+        require(residual < 1e-10, "Impulse left an unexpected residual tail.");
+        tested.prepare(setting, sampleRate);
+        const auto cycle = static_cast<int>(sampleRate / 100);
+        double signalPower = 0, noisePower = 0, ss = 0, cc = 0;
+        for (int i = 0; i < cycle * 20; ++i)
+        {
+            const auto angle = 2 * nx::tonalPi * 100 * i / sampleRate;
+            const auto output = tested.process(0.2 * std::sin(angle));
+            if (i >= cycle * 10)
+            {
+                ss += output * std::sin(angle);
+                cc += output * std::cos(angle);
+                signalPower += output * output;
+            }
+        }
+        const auto fundamental = 2 * (ss * ss + cc * cc) / (cycle * 10);
+        noisePower = std::max(0.0, signalPower - fundamental);
+        require(std::sqrt(noisePower / fundamental) < 1e-6, "Steady-state EQ THD+N exceeded -120 dB.");
+    }
+
     nx::TonalEqualizer eq;
     eq.prepare(rate);
     double l = 0.5, r = -0.5;
@@ -96,15 +131,56 @@ int main()
     nx::Spectrum different = single;
     different[nx::spectralBand(11000)] = 0.7f;
     const auto proposed = nx::match(single, different, 0.35, 3.0);
-    double budget = 0;
     for (const auto& band : proposed)
-    {
-        budget += std::abs(band.gain);
         require(band.gain <= 0 || band.frequency < 2000, "Matching boosted a missing frequency region.");
-    }
-    require(budget <= 3.00001, "Combined automatic correction exceeded the limit.");
     for (const auto& band : nx::match(single, different, 0, 3))
         require(band.gain == 0, "Intensity zero produced a correction.");
+
+    nx::Spectrum broadband {}, knownReference {};
+    nx::Bells known {};
+    constexpr std::array<double, 5> gains {3.0, -2.5, 2.8, -2.8, 2.2};
+    for (int i = 0; i < 5; ++i)
+        known[static_cast<std::size_t>(i)] = {nx::bandFrequency(12 + i * 15), gains[static_cast<std::size_t>(i)], 1.1 + 0.3 * i};
+    for (int i = 0; i < nx::tonalBands; ++i)
+    {
+        broadband[i] = 0.0003f;
+        knownReference[i] = static_cast<float>(broadband[i] * 5
+            * std::pow(10.0, nx::eqResponse(known, nx::bandFrequency(i), rate) / 10.0));
+    }
+    const auto fit = nx::match(broadband, knownReference, 1, 4, 0.15, 0, rate);
+    const auto quarter = nx::match(broadband, knownReference, 0.25, 4, 0.15, 0, rate);
+    const auto half = nx::match(broadband, knownReference, 0.5, 4, 0.15, 0, rate);
+    const auto difference = nx::tonalDifference(broadband, knownReference, 0, rate);
+    const auto beforeError = difference.error({}, rate);
+    const auto afterError = difference.error(fit, rate);
+    require(nx::activeBands(fit) >= 4 && afterError < beforeError * 0.42,
+            "Multiband fitting did not recover the known reference.");
+    require(difference.error(quarter, rate) > difference.error(half, rate)
+        && difference.error(half, rate) > afterError, "Error should improve monotonically at 25, 50 and 100% intensity.");
+    for (std::size_t i = 0; i < fit.size(); ++i)
+        require(near(quarter[i].gain, fit[i].gain * 0.25, 1e-6), "Intensity must scale the same correction.");
+    for (int i = 0; i <= 4096; ++i)
+    {
+        const auto hz = 20 * std::pow(1000.0, i / 4096.0);
+        require(std::abs(nx::eqResponse(fit, hz, rate)) <= 4, "Combined EQ exceeded its cap on a dense sweep.");
+    }
+    const auto narrow = nx::match(broadband, knownReference, 1, 4, 0.15, 0, rate, 120, 5000);
+    for (const auto& band : narrow)
+        require(band.gain == 0 || (band.frequency >= 120 && band.frequency <= 5000), "EQ ignored the selected range.");
+    auto identical = broadband;
+    for (auto& power : identical)
+        power *= 10;
+    require(nx::activeBands(nx::match(broadband, identical, 1, 6)) == 0,
+            "A level difference on an identical spectrum must not generate EQ.");
+    const auto fittedCompensation = nx::estimateCompensation(broadband, fit, rate);
+    double outputEnergy = 0;
+    for (int i = 0; i < nx::tonalBands; ++i)
+        outputEnergy += broadband[i] * std::pow(10.0,
+            (nx::eqResponse(fit, nx::bandFrequency(i), rate) + fittedCompensation) / 10);
+    require(near(nx::powerDb(outputEnergy / nx::spectrumEnergy(broadband)), 0, 0.01),
+            "Matched broadband compensation exceeded its error tolerance.");
+    std::cout << "Known spectral differences: " << beforeError << " -> " << afterError
+              << " dB weighted RMS using " << nx::activeBands(fit) << " bands.\n";
 
     const auto samePan = nx::masking(single, single, 0.1, 0.15);
     const auto oppositePan = nx::masking(single, single, -1, 1);
@@ -252,24 +328,30 @@ int main()
     require(bus.available && near(bus.suggested, -3, 0.01), "Global headroom must use the measured bus.");
     require(nx::planGlobalHeadroom(-20, -19, -6, -1, 0).suggested == 0, "Headroom manager must not raise a quiet mix.");
 
-    std::array<nx::TonalEqualizer, 48> instances;
-    for (auto& instance : instances)
+    for (const int instancesCount : {16, 32, 64, 128})
     {
-        instance.prepare(96000);
-        instance.update(request);
-    }
-    const auto start = std::chrono::steady_clock::now();
-    double checksum = 0;
-    for (int i = 0; i < 9600; ++i)
+        std::vector<nx::TonalEqualizer> instances(static_cast<std::size_t>(instancesCount));
+        nx::EqualizerSettings worstCase;
+        for (std::size_t i = 0; i < worstCase.bands.size(); ++i)
+            worstCase.bands[i] = {120.0 * (i + 1), i % 2 ? -2.0 : 2.0, 1.1};
         for (auto& instance : instances)
         {
-            l = sine(i);
-            r = l * 0.5;
-            instance.process(l, r);
-            checksum += l * l + r * r;
+            instance.prepare(96000);
+            instance.update(worstCase);
         }
-    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    require(std::isfinite(checksum) && checksum > 0, "Multi-instance run produced invalid samples.");
-    std::cout << "FFT 4096/8192/16384, response, THD, phase, compensation, limits and masking passed. "
-              << "48 EQ instances / 100 ms of audio: " << elapsed << " ms of runtime.\n";
+        const auto start = std::chrono::steady_clock::now();
+        double checksum = 0;
+        for (int i = 0; i < 9600; ++i)
+            for (auto& instance : instances)
+            {
+                l = sine(i);
+                r = l * 0.5;
+                instance.process(l, r);
+                checksum += l * l + r * r;
+            }
+        const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        require(std::isfinite(checksum) && checksum > 0, "Multi-instance run produced invalid samples.");
+        std::cout << instancesCount << " x 12-band EQ instances / 100 ms audio: " << elapsed << " ms runtime.\n";
+    }
+    std::cout << "FFT 4096/8192/16384, response, THD, phase, compensation, limits and masking passed.\n";
 }

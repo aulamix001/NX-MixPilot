@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <vector>
 
 namespace nx
 {
@@ -62,7 +63,13 @@ struct Bell
     double frequency = 1000, gain = 0, q = 0.8;
     bool operator==(const Bell& b) const { return frequency == b.frequency && gain == b.gain && q == b.q; }
 };
-using Bells = std::array<Bell, 3>;
+constexpr int maxTonalFilters = 12;
+using Bells = std::array<Bell, maxTonalFilters>;
+inline int activeBands(const Bells& bells)
+{
+    return static_cast<int>(std::count_if(bells.begin(), bells.end(),
+        [](const auto& bell) { return std::abs(bell.gain) >= 0.0001; }));
+}
 
 struct EqualizerSettings
 {
@@ -130,9 +137,14 @@ public:
         if (remaining > 0 || requested == applied)
             return;
         auto& next = banks[1 - active];
-        for (auto& channel : next.channels)
-            for (std::size_t i = 0; i < requested.bands.size(); ++i)
-                channel[i].prepare(requested.bands[i], sampleRate);
+        next.used = 0;
+        for (const auto& band : requested.bands)
+            if (std::abs(band.gain) >= 0.0001)
+            {
+                for (auto& channel : next.channels)
+                    channel[next.used].prepare(band, sampleRate);
+                ++next.used;
+            }
         next.gain = std::pow(10.0, requested.compensation / 20.0);
         remaining = fadeLength;
         applied = requested;
@@ -158,14 +170,16 @@ public:
 private:
     struct Bank
     {
-        std::array<std::array<BellFilter, 3>, 2> channels {};
+        std::array<std::array<BellFilter, maxTonalFilters>, 2> channels {};
         double gain = 1;
+        std::size_t used = 0;
         void process(double& left, double& right)
         {
-            for (auto& filter : channels[0])
-                left = filter.process(left);
-            for (auto& filter : channels[1])
-                right = filter.process(right);
+            for (std::size_t i = 0; i < used; ++i)
+            {
+                left = channels[0][i].process(left);
+                right = channels[1][i].process(right);
+            }
             left *= gain;
             right *= gain;
         }
@@ -178,7 +192,7 @@ private:
 
 inline double estimateCompensation(const Spectrum& input, const Bells& bells, double rate)
 {
-    std::array<BellFilter, 3> filters;
+    std::array<BellFilter, maxTonalFilters> filters;
     for (std::size_t i = 0; i < bells.size(); ++i)
         filters[i].prepare(bells[i], rate);
     double before = 0, after = 0;
@@ -193,7 +207,7 @@ inline double estimateCompensation(const Spectrum& input, const Bells& bells, do
             power *= filter.response(hz, rate);
         after += power;
     }
-    return before > 1.0e-10 && after > 1.0e-10 ? std::clamp(powerDb(before / after), -3.0, 3.0) : 0.0;
+    return before > 1.0e-10 && after > 1.0e-10 ? powerDb(before / after) : 0.0;
 }
 
 struct Profile
@@ -202,11 +216,12 @@ struct Profile
     double warmth, presence, air;
 };
 
-inline constexpr std::array<Profile, 10> profiles {{
+inline constexpr std::array<Profile, 13> profiles {{
     {"Worship", 0.3, 0.7, 0.4}, {"Gospel Contemporâneo", 0.5, 0.8, 0.5},
     {"Pop", 0.0, 0.8, 0.8}, {"Pop Rock", -0.2, 0.9, 0.35}, {"Rock", 0.25, 1, -0.25},
     {"Sertanejo", -0.2, 0.5, 0.7}, {"Jazz", 0.55, 0.0, -0.35},
-    {"Orquestral", 0.35, 0.1, -0.1}, {"Eletrônico", 0.8, -0.15, 0.8}, {"Personalizado", 0, 0, 0}
+    {"Orquestral", 0.35, 0.1, -0.1}, {"Eletrônico", 0.8, -0.15, 0.8}, {"Personalizado", 0, 0, 0},
+    {"Acústico", 0.45, 0.15, 0.15}, {"Hip-Hop", 0.9, 0.5, 0.25}, {"Cinematográfico", 0.5, 0.1, 0.5}
 }};
 
 inline double bellShape(double hz, double center, double width)
@@ -215,12 +230,22 @@ inline double bellShape(double hz, double center, double width)
     return std::exp(-0.5 * x * x);
 }
 
-inline Spectrum adaptiveTarget(const Spectrum& source, int category, bool principal, const Profile& profile)
+enum class SourceProfile { family, vocal, backing, acoustic, electric, piano, bass, drums, pad, bus };
+
+inline Spectrum adaptiveTarget(const Spectrum& source, int category, bool principal, const Profile& profile,
+                               SourceProfile instrument = SourceProfile::family)
 {
     // The measured envelope is the base, so profiles never impose a flat or generic spectrum.
     constexpr double warmth[] {0.2, 0.75, 0.15, -0.3, 0.25, 0.4, -0.35, 0};
     constexpr double articulation[] {0.2, -0.5, 0.1, 0.35, 0.0, 0.25, 0.8, 0};
     category = std::clamp(category, 0, 7);
+    struct Anchor { double hz, width, gain; };
+    constexpr std::array<Anchor, 10> anchors {{
+        {1000, 1, 0}, {3100, 1.1, 0.55}, {700, 1.5, 0.25}, {2500, 1.1, 0.40},
+        {1500, 1.1, 0.35}, {850, 1.25, 0.30}, {90, 0.85, 0.60},
+        {150, 1.4, 0.35}, {500, 1.7, 0.20}, {180, 1.4, 0.15}
+    }};
+    const auto anchor = anchors[static_cast<std::size_t>(instrument)];
     Spectrum target {};
     for (int band = 0; band < tonalBands; ++band)
     {
@@ -235,60 +260,227 @@ inline Spectrum adaptiveTarget(const Spectrum& source, int category, bool princi
         }
         const auto tilt = (profile.warmth + warmth[category]) * bellShape(hz, 160, 1.2)
             + (profile.presence + articulation[category] + (principal ? 0.45 : -0.2)) * bellShape(hz, 2300, 1.0)
-            + profile.air * bellShape(hz, 9000, 0.9);
+            + profile.air * bellShape(hz, 9000, 0.9) + anchor.gain * bellShape(hz, anchor.hz, anchor.width);
         target[band] = static_cast<float>(0.55 * source[band] + 0.45 * power / weight)
             * static_cast<float>(std::pow(10.0, tilt / 10.0));
     }
     return target;
 }
 
-inline Bells match(const Spectrum& current, const Spectrum& target, double intensity, double limit,
-                   double toleranceDb = 0.0)
+inline double eqResponse(const Bells& bells, double hz, double rate)
 {
-    Bells result {};
-    const auto currentTotal = spectrumEnergy(current), targetTotal = spectrumEnergy(target);
-    if (currentTotal < 1.0e-9 || targetTotal < 1.0e-9)
-        return result;
-    const auto floor = *std::max_element(current.begin(), current.end()) * 0.002;
-    std::array<double, tonalBands> differences {};
-    for (int bin = 1; bin < tonalBands - 1; ++bin)
+    double db = 0;
+    for (const auto& bell : bells)
     {
-        if (current[bin] <= std::max(1.0e-10, floor))
+        if (bell.gain == 0)
             continue;
-        const int from = std::max(0, bin - 3), to = std::min(tonalBands - 1, bin + 3);
-        double a = 0, b = 0;
-        for (int k = from; k <= to; ++k)
-        {
-            a += current[k] / currentTotal;
-            b += target[k] / targetTotal;
-        }
-        const auto difference = powerDb(b) - powerDb(a);
-        const auto outside = std::max(0.0, std::abs(difference) - toleranceDb);
-        differences[bin] = std::clamp(intensity * std::copysign(outside, difference), -limit, limit);
+        BellFilter filter;
+        filter.prepare(bell, rate);
+        db += powerDb(filter.response(hz, rate));
     }
-    for (auto& bell : result)
-    {
-        const auto found = std::max_element(differences.begin(), differences.end(),
-            [](double a, double b) { return std::abs(a) < std::abs(b); });
-        if (std::abs(*found) < 0.20)
-            break;
-        const int band = static_cast<int>(found - differences.begin());
-        // Split the cap across the three overlapping bells to bound the total boost/cut.
-        bell = {bandFrequency(band), std::clamp(*found, -limit / 3.0, limit / 3.0), 0.95};
-        std::fill(differences.begin() + std::max(0, band - 11),
-                  differences.begin() + std::min(tonalBands, band + 12), 0.0);
-    }
-    return result;
+    return db;
 }
 
-inline void limitCorrection(Bells& bells, double limit)
+inline void limitCorrection(Bells& bells, double limit, double rate = 48000)
 {
-    double budget = 0;
-    for (const auto& bell : bells)
-        budget += std::abs(bell.gain);
-    if (budget > limit && budget > 0)
+    for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        std::array<BellFilter, maxTonalFilters> filters;
+        for (std::size_t i = 0; i < bells.size(); ++i)
+            filters[i].prepare(bells[i], rate);
+        const auto magnitude = [&](double hz)
+        {
+            double db = 0;
+            for (const auto& filter : filters)
+                if (filter.active)
+                    db += powerDb(filter.response(hz, rate));
+            return std::abs(db);
+        };
+        double peak = 0;
+        const auto upper = std::min(20000.0, rate * 0.49);
+        for (int i = 0; i <= 768; ++i)
+            peak = std::max(peak, magnitude(20 * std::pow(upper / 20, i / 768.0)));
+        for (const auto& bell : bells)
+            if (bell.gain != 0)
+                peak = std::max(peak, magnitude(std::min(bell.frequency, upper)));
+        // Leave room for peaks falling between adjacent evaluation frequencies.
+        const auto ceiling = std::max(0.0, limit - 0.02);
+        if (peak <= ceiling || peak == 0)
+            return;
         for (auto& bell : bells)
-            bell.gain *= limit / budget;
+            bell.gain *= ceiling / peak;
+    }
+}
+
+struct TonalDifference
+{
+    std::array<double, tonalBands> db {}, weight {};
+    double totalWeight = 0;
+
+    void center(std::array<double, tonalBands>& values) const
+    {
+        if (totalWeight == 0)
+            return;
+        double mean = 0;
+        for (int i = 0; i < tonalBands; ++i)
+            mean += values[i] * weight[i];
+        mean /= totalWeight;
+        for (auto& value : values)
+            value -= mean;
+    }
+
+    double error(const Bells& bells, double rate) const
+    {
+        if (totalWeight == 0)
+            return 0;
+        auto residual = db;
+        for (int i = 0; i < tonalBands; ++i)
+            if (weight[i] > 0)
+                residual[i] -= eqResponse(bells, bandFrequency(i), rate);
+        center(residual);
+        double sum = 0;
+        for (int i = 0; i < tonalBands; ++i)
+            sum += weight[i] * residual[i] * residual[i];
+        return std::sqrt(sum / totalWeight);
+    }
+};
+
+inline TonalDifference tonalDifference(const Spectrum& current, const Spectrum& target, int smooth, double rate,
+                                      double low = 20, double high = 20000)
+{
+    TonalDifference difference;
+    const auto inputPeak = *std::max_element(current.begin(), current.end());
+    const auto targetPeak = *std::max_element(target.begin(), target.end());
+    if (inputPeak < 1.0e-10 || targetPeak < 1.0e-10)
+        return difference;
+    std::array<double, tonalBands> raw {};
+    for (int i = 0; i < tonalBands; ++i)
+        if (current[i] > inputPeak * 0.0002 && target[i] > targetPeak * 0.00005 && bandFrequency(i) < rate * 0.47
+            && bandFrequency(i) >= low && bandFrequency(i) <= high)
+        {
+            raw[i] = powerDb(target[i] / static_cast<double>(targetPeak))
+                   - powerDb(current[i] / static_cast<double>(inputPeak));
+            difference.weight[i] = std::clamp(std::sqrt(current[i] / (inputPeak * 0.08)), 0.06, 1.0);
+            difference.totalWeight += difference.weight[i];
+        }
+    smooth = std::clamp(smooth, 0, 6);
+    for (int i = 0; i < tonalBands; ++i)
+    {
+        if (difference.weight[i] == 0)
+            continue;
+        double total = 0;
+        for (int k = std::max(0, i - smooth); k <= std::min(tonalBands - 1, i + smooth); ++k)
+        {
+            const double weight = (smooth + 1 - std::abs(i - k)) * difference.weight[k];
+            difference.db[i] += weight * raw[k];
+            total += weight;
+        }
+        difference.db[i] /= total;
+    }
+    difference.center(difference.db);
+    return difference;
+}
+
+inline Bells match(const Spectrum& current, const Spectrum& target, double intensity, double limit,
+                   double toleranceDb = 0.35, int smooth = 2, double rate = 48000,
+                   double low = 20, double high = 20000)
+{
+    Bells result {};
+    intensity = std::clamp(intensity, 0.0, 1.0);
+    if (intensity == 0 || limit <= 0)
+        return result;
+    const auto difference = tonalDifference(current, target, smooth, rate, low, high);
+    if (difference.totalWeight == 0)
+        return result;
+    auto residual = difference.db;
+    constexpr std::array<double, 5> widths {0.45, 0.75, 1.1, 1.8, 3.2};
+    struct Candidate
+    {
+        int index;
+        double q, norm;
+        std::array<double, tonalBands> basis;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(tonalBands * widths.size());
+    const auto weight = difference.weight;
+    std::array<double, tonalBands> frequencies {};
+    for (int i = 0; i < tonalBands; ++i)
+        frequencies[i] = bandFrequency(i);
+    for (int i = 0; i < tonalBands; ++i)
+        if (weight[i] != 0)
+            for (const auto q : widths)
+            {
+                Candidate candidate {i, q, 0, {}};
+                BellFilter filter;
+                filter.prepare({frequencies[i], 1, q}, rate);
+                for (int k = 0; k < tonalBands; ++k)
+                    if (weight[k] != 0)
+                        candidate.basis[k] = powerDb(filter.response(frequencies[k], rate));
+                difference.center(candidate.basis);
+                for (int k = 0; k < tonalBands; ++k)
+                    candidate.norm += weight[k] * candidate.basis[k] * candidate.basis[k];
+                if (candidate.norm > 1e-8)
+                    candidates.push_back(candidate);
+            }
+
+    for (auto& band : result)
+    {
+        double best = 0;
+        for (const auto& candidate : candidates)
+        {
+            const auto i = candidate.index;
+            if (std::abs(residual[i]) <= toleranceDb)
+                continue;
+            double dot = 0;
+            for (int k = 0; k < tonalBands; ++k)
+                dot += weight[k] * candidate.basis[k] * residual[k];
+            const auto boostCap = weight[i] < 0.22 ? limit * 0.4 : limit;
+            const auto gain = std::clamp(dot / candidate.norm, -limit, boostCap);
+            const auto score = gain * (2 * dot - gain * candidate.norm);
+            if (std::abs(gain) >= 0.22 && score > best)
+            {
+                best = score;
+                band = {frequencies[i], gain, candidate.q};
+            }
+        }
+        if (best <= difference.totalWeight * 0.0008)
+        {
+            band = {};
+            break;
+        }
+        std::array<double, tonalBands> response {};
+        BellFilter filter;
+        filter.prepare(band, rate);
+        for (int k = 0; k < tonalBands; ++k)
+            if (weight[k] > 0)
+                response[k] = powerDb(filter.response(frequencies[k], rate));
+        difference.center(response);
+        double improvement = 0;
+        for (int k = 0; k < tonalBands; ++k)
+            improvement += weight[k] * response[k] * (2 * residual[k] - response[k]);
+        if (improvement <= 0)
+        {
+            band = {};
+            break;
+        }
+        for (int k = 0; k < tonalBands; ++k)
+            residual[k] -= response[k];
+    }
+    limitCorrection(result, limit, rate);
+    const auto acceptableError = difference.error(result, rate) + std::max(0.04, toleranceDb * 0.12);
+    for (auto band = result.rbegin(); band != result.rend(); ++band)
+        if (band->gain != 0)
+        {
+            const auto previous = *band;
+            *band = {};
+            if (difference.error(result, rate) > acceptableError)
+                *band = previous;
+        }
+    limitCorrection(result, limit, rate);
+    for (auto& band : result)
+        band.gain *= intensity;
+    limitCorrection(result, limit, rate);
+    return result;
 }
 
 struct Conflict

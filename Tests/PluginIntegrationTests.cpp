@@ -2,6 +2,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "ReferenceAudio.h"
+#include "SpectralWorker.h"
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -160,8 +161,10 @@ int main()
     require(read(*second, "toneG1") == 0, "Analysis must not write EQ.");
     click(*suggestion->getParentComponent(), "Ouvir B");
     require(read(*second, "toneG1") == 0, "Preview must not write EQ.");
+    const auto originalTrim = read(*second, "trim");
     click(*suggestion->getParentComponent(), "Aplicar EQ");
     require(read(*second, "toneG1") < -0.1f, "Approved masking correction did not reach the target Track.");
+    require(read(*second, "trim") == originalTrim, "Applying EQ must not rewrite gain staging.");
     click(*suggestion->getParentComponent(), "Desfazer EQ");
     require(std::abs(read(*second, "toneG1")) < 1.0e-5f, "Undo did not restore the original EQ.");
 
@@ -418,6 +421,49 @@ int main()
         require(read(*restored, "continuousGain") == 1 && read(*restored, "safetyLimiter") == 1
                 && std::abs(read(*restored, "limiterCeiling") + 6) < 0.02,
                 "The processing switches and ceiling must survive preset roundtrip.");
+    }
+
+    {
+        Plugin source(createPluginFilter()), restored(createPluginFilter());
+        write(*source, "toneF12", 3300);
+        write(*source, "toneG12", -2.5f);
+        write(*source, "toneQ12", 2.1f);
+        juce::MemoryBlock state;
+        source->getStateInformation(state);
+        restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        require(std::abs(read(*restored, "toneF12") - 3300) < 0.1f
+                && std::abs(read(*restored, "toneG12") + 2.5f) < 0.01f
+                && std::abs(read(*restored, "toneQ12") - 2.1f) < 0.01f,
+                "The twelfth EQ band must roundtrip through the plugin state.");
+
+        nx::SpectralWorker worker;
+        constexpr unsigned token = 55;
+        worker.capture(token, 15);
+        for (int frame = 0; frame < 180; ++frame)
+        {
+            for (int i = 0; i < 4096; ++i)
+                worker.push({0, 0, 0, 0, frame * 4096LL + i, 48000, 1});
+            if (frame % 3 == 0)
+                juce::Thread::sleep(9);
+        }
+        juce::Thread::sleep(30);
+        require(worker.captureProgress(token).seconds == 0, "Silent FFT frames must not advance tonal capture.");
+        for (int frame = 0; frame < 240 && worker.captureProgress(token).seconds < 15; ++frame)
+        {
+            for (int i = 0; i < 4096; ++i)
+            {
+                const auto sample = static_cast<float>(0.1 * std::sin(6.283185307179586 * i / 48));
+                worker.push({sample, sample, sample, sample, (180 + frame) * 4096LL + i, 48000, 1});
+            }
+            if (frame % 3 == 0)
+                juce::Thread::sleep(9);
+        }
+        juce::Thread::sleep(45);
+        const auto captured = worker.captureProgress(token);
+        require(captured.seconds >= 15 && captured.seconds < 15.09, "Tonal capture must finish at 15 seconds of active audio.");
+        const auto peak = std::distance(captured.power.begin(), std::max_element(captured.power.begin(), captured.power.end()));
+        require(std::abs(nx::bandFrequency(static_cast<double>(peak)) - 1000) < 80,
+                "Captured spectrum must retain the actual tone frequency.");
     }
 
     const auto file = juce::File::createTempFile(".wav");

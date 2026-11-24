@@ -8,7 +8,7 @@ namespace nx
 class TonalPanel final : public juce::Component
 {
 public:
-    enum Action { selectTracks, capture, import, suggest, masking, preview, apply, cancel, undo, bypass, lowEnd, vocal, library };
+    enum Action { selectTracks, capture, captureSignal, import, suggest, masking, preview, apply, cancel, undo, bypass, lowEnd, vocal, library, removeBand };
 
     explicit TonalPanel(std::function<void(Action)> callback)
         : action(std::move(callback))
@@ -23,11 +23,22 @@ public:
         frequency.setSkewFactorFromMidPoint(1000);
         configure(gain, -12, 12, 0.05, 0, " dB");
         configure(q, 0.3, 8, 0.05, 0.95, "");
-        correction.addItemList({"Banda 1", "Banda 2", "Banda 3"}, 1);
-        correction.setSelectedId(1);
         addAndMakeVisible(correction);
+        duration.addItemList({"15 s", "20 s", "30 s"}, 1);
+        duration.setSelectedId(1);
+        duration.setTitle(juce::String::fromUTF8("Duração da captura ativa"));
+        addAndMakeVisible(duration);
+        smoothing.addItemList({"Suav. 0", "Suav. 1", "Suav. 2", "Suav. 3", "Suav. 4", "Suav. 5", "Suav. 6"}, 1);
+        smoothing.setSelectedId(3);
+        smoothing.setTitle(juce::String::fromUTF8("Suavização espectral"));
+        addAndMakeVisible(smoothing);
+        range.addItemList({"20-20k Hz", "20-250 Hz", "120-5k Hz", "2k-20k Hz"}, 1);
+        range.setSelectedId(1);
+        range.setTitle(juce::String::fromUTF8("Faixa tonal de correção"));
+        addAndMakeVisible(range);
         bind(targets, "Pistas alvo", selectTracks);
         bind(captureButton, "Capturar ref.", capture);
+        bind(signalButton, "Capturar sinal", captureSignal);
         bind(importButton, "Importar", import);
         bind(suggestButton, "Sugerir EQ", suggest);
         bind(maskButton, "Mascaramento", masking);
@@ -39,7 +50,9 @@ public:
         bind(lowButton, "Low End", lowEnd);
         bind(vocalButton, "Vocal", vocal);
         bind(libraryButton, "Biblioteca", library);
-        compensation.setButtonText("Compensar ganho");
+        bind(removeButton, "Excluir banda", removeBand);
+        compensation.setButtonText("Compensar");
+        compensation.setTooltip(juce::String::fromUTF8("Compensa o nível RMS estimado do EQ na prévia e na aplicação."));
         compensation.setToggleState(true, juce::dontSendNotification);
         addAndMakeVisible(compensation);
     }
@@ -50,19 +63,24 @@ public:
         targets.setBounds(213, 39, 111, 26);
         intensity.setBounds(77, 71, 105, 25);
         limit.setBounds(231, 71, 93, 25);
-        captureButton.setBounds(14, 104, 99, 26);
-        importButton.setBounds(119, 104, 96, 26);
-        libraryButton.setBounds(224, 104, 100, 26);
+        captureButton.setBounds(14, 104, 86, 26);
+        signalButton.setBounds(104, 104, 85, 26);
+        importButton.setBounds(193, 104, 62, 26);
+        libraryButton.setBounds(259, 104, 65, 26);
         suggestButton.setBounds(14, 139, 151, 29);
         maskButton.setBounds(174, 139, 150, 29);
-        correction.setBounds(14, 194, 96, 26);
-        compensation.setBounds(119, 193, 195, 27);
+        correction.setBounds(14, 194, 208, 26);
+        removeButton.setBounds(228, 194, 96, 26);
         frequency.setBounds(69, 226, 255, 24);
         gain.setBounds(69, 255, 255, 24);
         q.setBounds(69, 284, 255, 24);
-        previewButton.setBounds(14, 324, 101, 28);
-        applyButton.setBounds(122, 324, 99, 28);
-        cancelButton.setBounds(228, 324, 96, 28);
+        duration.setBounds(14, 308, 57, 22);
+        smoothing.setBounds(76, 308, 70, 22);
+        range.setBounds(151, 308, 94, 22);
+        compensation.setBounds(250, 307, 74, 23);
+        previewButton.setBounds(14, 333, 101, 24);
+        applyButton.setBounds(122, 333, 99, 24);
+        cancelButton.setBounds(228, 333, 96, 24);
         undoButton.setBounds(14, 360, 151, 26);
         bypassButton.setBounds(174, 360, 150, 26);
         lowButton.setBounds(14, 391, 151, 24);
@@ -89,11 +107,15 @@ public:
         g.drawFittedText(status, 14, 418, 308, 26, juce::Justification::topLeft, 2);
     }
 
-    void update(bool hasProposal, bool isPreview, bool hasUndo, bool isBypassed)
+    void update(bool hasProposal, bool isPreview, bool hasUndo, bool isBypassed, bool captureRunning = false)
     {
         previewButton.setEnabled(hasProposal);
         applyButton.setEnabled(hasProposal);
-        cancelButton.setEnabled(hasProposal);
+        cancelButton.setEnabled(hasProposal || captureRunning);
+        removeButton.setEnabled(hasProposal && correction.getSelectedId() > 0);
+        captureButton.setEnabled(!captureRunning);
+        signalButton.setEnabled(!captureRunning);
+        duration.setEnabled(!captureRunning);
         undoButton.setEnabled(hasUndo);
         correction.setEnabled(hasProposal);
         frequency.setEnabled(hasProposal);
@@ -103,7 +125,11 @@ public:
         bypassButton.setButtonText(isBypassed ? "Ativar EQ" : "Bypass EQ");
     }
 
-    juce::ComboBox genre, correction;
+    int captureSeconds() const { return std::array<int, 3>{15, 20, 30}[std::max(0, duration.getSelectedId() - 1)]; }
+    double lowHz() const { return std::array<double, 4>{20, 20, 120, 2000}[std::max(0, range.getSelectedId() - 1)]; }
+    double highHz() const { return std::array<double, 4>{20000, 250, 5000, 20000}[std::max(0, range.getSelectedId() - 1)]; }
+
+    juce::ComboBox genre, correction, duration, smoothing, range;
     juce::Slider intensity, limit, frequency, gain, q;
     juce::ToggleButton compensation;
     juce::String summary, status;
@@ -135,7 +161,7 @@ private:
     }
 
     std::function<void(Action)> action;
-    juce::TextButton targets, captureButton, importButton, suggestButton, maskButton,
+    juce::TextButton targets, captureButton, signalButton, removeButton, importButton, suggestButton, maskButton,
         previewButton, applyButton, cancelButton, undoButton, bypassButton, lowButton, vocalButton, libraryButton;
 };
 }
