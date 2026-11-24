@@ -1,4 +1,4 @@
-# Auditoria DSP do MixPilot v0.3.10
+# Auditoria DSP do MixPilot v0.3.11
 
 ## Causa e correção
 

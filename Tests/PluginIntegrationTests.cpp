@@ -436,30 +436,30 @@ int main()
                 && std::abs(read(*restored, "toneQ12") - 2.1f) < 0.01f,
                 "The twelfth EQ band must roundtrip through the plugin state.");
 
-        nx::SpectralWorker worker;
+        auto worker = std::make_unique<nx::SpectralWorker>();
         constexpr unsigned token = 55;
-        worker.capture(token, 15);
+        worker->capture(token, 15);
         for (int frame = 0; frame < 180; ++frame)
         {
             for (int i = 0; i < 4096; ++i)
-                worker.push({0, 0, 0, 0, frame * 4096LL + i, 48000, 1});
+                worker->push({0, 0, 0, 0, frame * 4096LL + i, 48000, 1});
             if (frame % 3 == 0)
                 juce::Thread::sleep(9);
         }
         juce::Thread::sleep(30);
-        require(worker.captureProgress(token).seconds == 0, "Silent FFT frames must not advance tonal capture.");
-        for (int frame = 0; frame < 240 && worker.captureProgress(token).seconds < 15; ++frame)
+        require(worker->captureProgress(token).seconds == 0, "Silent FFT frames must not advance tonal capture.");
+        for (int frame = 0; frame < 240 && worker->captureProgress(token).seconds < 15; ++frame)
         {
             for (int i = 0; i < 4096; ++i)
             {
                 const auto sample = static_cast<float>(0.1 * std::sin(6.283185307179586 * i / 48));
-                worker.push({sample, sample, sample, sample, (180 + frame) * 4096LL + i, 48000, 1});
+                worker->push({sample, sample, sample, sample, (180 + frame) * 4096LL + i, 48000, 1});
             }
             if (frame % 3 == 0)
                 juce::Thread::sleep(9);
         }
         juce::Thread::sleep(45);
-        const auto captured = worker.captureProgress(token);
+        const auto captured = worker->captureProgress(token);
         require(captured.seconds >= 15 && captured.seconds < 15.09, "Tonal capture must finish at 15 seconds of active audio.");
         const auto peak = std::distance(captured.power.begin(), std::max_element(captured.power.begin(), captured.power.end()));
         require(std::abs(nx::bandFrequency(static_cast<double>(peak)) - 1000) < 80,
