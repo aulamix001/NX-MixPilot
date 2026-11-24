@@ -1011,10 +1011,11 @@ public:
         spectralFreeze.setBounds(547, 159, 62, 25);
         spectrumOptions.setBounds(612, 159, 70, 25);
         tonalToggle.setBounds(865, 114, 162, 27);
+        advancedToggle.setBounds(670, 16, 104, 30);
         smartToggle.setBounds(813, 75, 215, 27);
-        smartPanel.setBounds(703, 404, 336, 447);
+        smartPanel.setBounds(703, advanced ? 404 : 255, 336, 447);
         tonalExclude.setBounds(724, 114, 135, 27);
-        tonalPanel.setBounds(703, 404, 336, 447);
+        tonalPanel.setBounds(703, advanced ? 404 : 255, 336, 447);
         category.setBounds(17, 745, 190, 27);
         instruments.setBounds(214, 745, 220, 27);
         targetPeak.setBounds(447, 745, 122, 27);

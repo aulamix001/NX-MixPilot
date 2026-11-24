@@ -62,7 +62,7 @@ juce::Component* findControl(juce::Component& parent, const juce::String& key)
 {
     for (auto* child : parent.getChildren())
     {
-        if (child->isVisible() && (child->getTitle() == key
+        if (child->isVisible() && !child->getBounds().isEmpty() && (child->getTitle() == key
                 || (dynamic_cast<juce::TextButton*>(child) != nullptr
                     && static_cast<juce::TextButton*>(child)->getButtonText() == key)))
             return child;
@@ -150,6 +150,9 @@ int main()
             "HUB focus command must affect only eligible instances in its session.");
 
     click(*editor, "Tonal Match");
+    auto* tonalAction = findControl(*editor, "Mascaramento");
+    require(tonalAction && editor->getLocalBounds().contains(editor->getLocalArea(tonalAction, tonalAction->getLocalBounds())),
+            "Tonal actions must remain visible inside the essential editor.");
     click(*editor, "Alvo de EQ: Guitarra");
     click(*editor, "Mascaramento");
     auto* suggestion = dynamic_cast<juce::Button*>(findControl(*editor, "Aplicar EQ"));
