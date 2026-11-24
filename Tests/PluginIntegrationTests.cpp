@@ -225,6 +225,95 @@ int main()
     require(std::abs(read(*second, "trim") + 6.5f) < 0.2f,
             "Worship Auto Gain must use the louder accompaniment RMS windows even when its peak ceiling is not active.");
 
+    {
+        Plugin kick(createPluginFilter());
+        props.name = "BUMBO - C1";
+        kick->updateTrackProperties(props);
+        write(*kick, "gainStyle", 1);
+        write(*kick, "peakReference", 1);
+        kick->setPlayHead(&playhead);
+        kick->prepareToPlay(rate, block);
+        std::unique_ptr<juce::AudioProcessorEditor> kickEditor(kick->createEditor());
+        pauseTimer();
+        constexpr double kickSamplePeak = 0.1798870915; // -14.9 dBFS
+        const auto renderKick = [&](bool hit)
+        {
+            signal.clear();
+            if (hit)
+                for (int i = 0; i < 64; ++i)
+                    for (int channel = 0; channel < 2; ++channel)
+                        signal.setSample(channel, i, kickSamplePeak * (1.0 - i / 64.0));
+            kick->processBlock(signal, midi);
+            playhead.position += block;
+        };
+        const auto captureKick = [&](bool withHits)
+        {
+            click(*kickEditor, "AUTO GAIN");
+            for (int frame = 0; frame < 34; ++frame)
+            {
+                for (int i = 0; i < 4; ++i)
+                    renderKick(withHits && i == 1 && (frame == 2 || frame == 7 || frame == 12));
+                juce::Thread::sleep(47);
+                juce::Timer::callPendingTimersSynchronously();
+            }
+        };
+        captureKick(true);
+        require(std::abs(read(*kick, "trim") - 4.9f) < 0.02f,
+                "A sparse kick followed by silence must receive the technical peak correction.");
+        for (int i = 0; i < 5; ++i)
+            renderKick(false);
+        renderKick(true);
+        require(std::abs(signal.getMagnitude(0, block) - std::pow(10.0, -10.0 / 20.0)) < 0.001,
+                "The correction must bring the actual insert output to the kick peak target.");
+        captureKick(true);
+        require(std::abs(read(*kick, "trim") - 4.9f) < 0.02f,
+                "Repeating technical calibration must not compound the kick gain.");
+        click(*kickEditor, "Desfazer");
+        require(std::abs(read(*kick, "trim")) < 0.02f, "Undo must restore the original kick trim.");
+        captureKick(false);
+        require(std::abs(read(*kick, "trim")) < 0.02f, "A silent capture must not boost the kick.");
+    }
+
+    {
+        Plugin mix(createPluginFilter()), vocal(createPluginFilter()), backing(createPluginFilter()),
+            piano(createPluginFilter()), bus(createPluginFilter());
+        props.name = "Lead Vox";
+        vocal->updateTrackProperties(props);
+        props.name = "BGV L";
+        backing->updateTrackProperties(props);
+        props.name = "Piano";
+        piano->updateTrackProperties(props);
+        props.name = "Piano Bus";
+        bus->updateTrackProperties(props);
+        for (auto* plugin : {mix.get(), vocal.get(), backing.get(), piano.get(), bus.get()})
+        {
+            write(*plugin, "session", 2);
+            plugin->setPlayHead(&playhead);
+            plugin->prepareToPlay(rate, block);
+        }
+        write(*mix, "instance", 1);
+        std::unique_ptr<juce::AudioProcessorEditor> mixEditor(mix->createEditor());
+        pauseTimer();
+        click(*mixEditor, "AUTO GAIN");
+        for (int frame = 0; frame < 34; ++frame)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                feed(*vocal, playhead, signal, midi, 375, frame < 14 ? 0.18 : 0.0, false);
+                feed(*backing, playhead, signal, midi, 375, frame < 14 ? 0.10 : 0.0, false);
+                feed(*piano, playhead, signal, midi, 375, frame < 14 ? 0.32 : 0.0, false);
+                feed(*bus, playhead, signal, midi, 375, 0.35, false);
+                playhead.position += block;
+            }
+            juce::Thread::sleep(47);
+            juce::Timer::callPendingTimersSynchronously();
+        }
+        require(std::abs(read(*vocal, "trim") - 4.89f) < 0.05f, "HUB must raise a quiet lead vocal toward -10 dBFS.");
+        require(std::abs(read(*backing, "trim") - 4.0f) < 0.05f, "HUB must use the distinct -16 dBFS backing preset.");
+        require(std::abs(read(*piano, "trim") + 4.10f) < 0.05f, "HUB must attenuate a hot piano toward -14 dBFS.");
+        require(std::abs(read(*bus, "trim")) < 0.02f, "Auto Gain must avoid processing a named bus again.");
+    }
+
     const auto file = juce::File::createTempFile(".wav");
     {
         juce::WavAudioFormat format;

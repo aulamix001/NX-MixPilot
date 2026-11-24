@@ -180,6 +180,7 @@ struct Change
     unsigned identity;
     float previous, next;
     std::optional<float> previousApplied;
+    unsigned peakCaptureId = 0;
 };
 
 class Processor;
@@ -385,14 +386,18 @@ public:
         }
         if (best != 0)
             return best;
-        for (const auto& alias : {std::pair<const char*, const char*>{"bass", "Baixo elétrico"},
-                                 {"baixo", "Baixo elétrico"}, {"piano", "Piano acústico"},
-                                 {"bumbo", "Kick"}, {"caixa", "Snare"}, {"hi-hat", "Hi-hat fechado"}, {"chimbal", "Hi-hat fechado"},
-                                 {"keys", "Teclado de arranjo"}, {"guitar", "Guitarra clean"},
-                                 {"guitarra", "Guitarra clean"}, {"backing", "Backing uníssono"},
-                                 {"coral", "Coral misto"}, {"vocal", "Vocal principal masculino"},
-                                 {"voz", "Vocal principal masculino"}})
-            if (name.contains(alias.first))
+        for (const auto& alias : {std::pair<const char*, const char*>{"backing", "Backing uníssono"},
+                                 {"back vocal", "Backing uníssono"}, {"bgv", "Backing uníssono"},
+                                 {"vox effect", "Vocal de ambiência"}, {"vocal fx", "Vocal de ambiência"},
+                                 {"choir", "Coral misto"}, {"coral", "Coral misto"}, {"coro", "Coral misto"},
+                                 {"vocals", "Vocal principal masculino"}, {"vocal", "Vocal principal masculino"},
+                                 {"voz", "Vocal principal masculino"}, {"vox", "Vocal principal masculino"},
+                                 {"bass", "Baixo elétrico"}, {"baixo", "Baixo elétrico"}, {"piano", "Piano acústico"},
+                                 {"bumbo", "Kick"}, {"caixa", "Snare"}, {"hi-hat", "Hi-hat fechado"},
+                                 {"chimbal", "Hi-hat fechado"}, {"keys", "Teclado de arranjo"},
+                                 {"guitar", "Guitarra clean"}, {"guitarra", "Guitarra clean"},
+                                 {"pad", "Pad atmosférico"}, {"strings", "Strings Ensemble"}})
+            if (name.containsWholeWord(alias.first))
                 for (std::size_t i = 0; i < std::size(nx::presets); ++i)
                     if (utf8(nx::presets[i].name) == utf8(alias.second))
                         return static_cast<int>(i) + 1;
@@ -432,14 +437,14 @@ public:
         return static_cast<float>(boost);
     }
 
-    bool tonalBus() const
+    bool gainBus() const
     {
-        const int assigned = static_cast<int>(value("instrument"));
-        const int inferred = inferredInstrument.load(std::memory_order_relaxed);
-        const int instrumentId = assigned > 0 ? assigned : inferred;
-        return hub() || value("toneExclude") > 0.5f || namedBus.load(std::memory_order_relaxed)
+        const int instrumentId = instrument();
+        return hub() || namedBus.load(std::memory_order_relaxed)
             || (instrumentId > 0 && nx::presets[instrumentId - 1].category == 7);
     }
+
+    bool tonalBus() const { return gainBus() || value("toneExclude") > 0.5f; }
 
     bool eligible(int sessionId) const { return !hub() && session() == sessionId && value("bypass") < 0.5f; }
     bool volumeUnlocked() const { return value("volumeLock") < 0.5f && value("referenceOnly") < 0.5f; }
@@ -602,7 +607,7 @@ public:
                         total += count;
                     const auto percentile = 0.85f + 0.15f * learningSensitivity.load();
                     unsigned cumulative = 0;
-                    for (std::size_t bin = 0; total != 0 && bin < learningHistogram.size(); ++bin)
+                    for (std::size_t bin = 0; total >= 2 && bin < learningHistogram.size(); ++bin)
                     {
                         cumulative += learningHistogram[bin];
                         if (cumulative >= std::ceil(total * percentile))
@@ -684,7 +689,7 @@ struct TrackRow
     float customPeak = 1.0f, outputGainDb = 0, toneBoost = 0, instrumentCeiling = 1;
     nx::SpectrumFrame spectrum;
     bool spectralCurrent = false;
-    bool tonalBus = false, volumeLocked = false, eqLocked = false, referenceOnly = false;
+    bool gainBus = false, tonalBus = false, volumeLocked = false, eqLocked = false, referenceOnly = false;
     int priority = 50;
     nx::Function function = nx::Function::automatic;
     nx::SmartGainResult diagnostics;
@@ -2652,6 +2657,7 @@ private:
             if (isHub)
                 track.spectrum.configure(std::max(0, fftChoice.getSelectedId() - 1), averageMs);
             row.spectralCurrent = row.current && track.spectrum.read(row.spectrum, plugin.session());
+            row.gainBus = track.gainBus();
             row.tonalBus = track.tonalBus();
             row.volumeLocked = track.value("volumeLock") > 0.5f;
             row.eqLocked = track.value("eqLock") > 0.5f;
@@ -2851,7 +2857,6 @@ private:
         analyzing = false;
         if (!smartAnalysing || smartPanel.gainModule.getToggleState())
             prepareChanges(true);
-        assignLearning(0);
         if (smartAnalysing)
         {
             if (smartPanel.toneModule.getToggleState())
@@ -2859,10 +2864,12 @@ private:
             if (smartPanel.maskModule.getToggleState())
                 suggestTone(true, smartPanel.toneModule.getToggleState());
             smartAnalysing = false;
-            status = utf8("Análise concluída. Revise as propostas antes de aplicar.");
+            if (!pending.empty() || !tonalPending.empty())
+                status = utf8("Análise concluída. Revise as propostas antes de aplicar.");
         }
         else if (!pending.empty())
             commit();
+        assignLearning(0);
     }
 
     void refreshHub()
@@ -2985,6 +2992,18 @@ private:
         return nx::StyleLane::other;
     }
 
+    bool calibratesByPeak(const TrackRow& row) const
+    {
+        return strategy() == nx::GainStrategy::technical
+            && (row.customPeak <= 0 || row.peakProfile > 0 || row.instrument > 0);
+    }
+
+    bool usesCapturedPeak(const TrackRow& row) const
+    {
+        return calibratesByPeak(row) && row.reading.learningId == activeLearning
+            && row.reading.learnedPeak > nx::floorDb;
+    }
+
     nx::SmartGainResult diagnoseGain(const TrackRow& row, float anchor, bool learned) const
     {
         auto reading = row.reading;
@@ -3014,7 +3033,8 @@ private:
                               row.peakProfile, row.trim, target, anchor, plugin.value("limit"), headroomDb, maximum,
                               row.instrumentCeiling, maxSample, row.outputGainDb + row.toneBoost,
                               static_cast<nx::GainStyle>(static_cast<int>(plugin.value("gainStyle"))),
-                              styleLane(row), row.customPeak > 0 && row.peakProfile == 0 && row.instrument > 0});
+                              styleLane(row), row.customPeak > 0 && row.peakProfile == 0 && row.instrument > 0,
+                              learned && usesCapturedPeak(row)});
     }
 
     void capture()
@@ -3039,9 +3059,15 @@ private:
         };
         const auto usable = [&](const TrackRow& row)
         {
-            return fresh(row) && canSuggest(row) && (!automatic
-                || (row.reading.learningId == activeLearning && row.reading.learnedActiveWindows >= 4
-                    && !(row.instrument > 0 && nx::presets[row.instrument - 1].category == 7)));
+            if (!fresh(row) || row.volumeLocked || row.referenceOnly)
+                return false;
+            if (!automatic)
+                return canSuggest(row);
+            if (row.reading.learningId != activeLearning || row.gainBus)
+                return false;
+            if (calibratesByPeak(row))
+                return usesCapturedPeak(row);
+            return canSuggest(row) && row.reading.learnedActiveWindows >= 4;
         };
         if (needsAnchor()
             && (focusRow < 0 || !fresh(rows[static_cast<std::size_t>(focusRow)])
@@ -3053,6 +3079,7 @@ private:
         }
         const auto anchor = currentAnchor(automatic);
         int skipped = 0;
+        int insufficient = 0;
         capturedSession = plugin.session();
         capturedHub = plugin.hub();
         capturedGainStyle = plugin.value("gainStyle");
@@ -3092,8 +3119,14 @@ private:
         {
             if (!inScope(row))
                 continue;
-            const auto diagnosis = usable(row) ? diagnoseGain(row, anchor, automatic) : nx::SmartGainResult{};
-            if (!usable(row) || (!commonCalibration && diagnosis.suggestion.headroomUnmet))
+            if (!usable(row))
+            {
+                ++insufficient;
+                ++skipped;
+                continue;
+            }
+            const auto diagnosis = diagnoseGain(row, anchor, automatic);
+            if (!commonCalibration && diagnosis.suggestion.headroomUnmet)
             {
                 ++skipped;
                 continue;
@@ -3108,13 +3141,19 @@ private:
                 continue;
             }
             if (std::abs(row.trim - next) >= 0.009f)
-                pending.push_back({row.identity, row.trim, next, {}});
+                pending.push_back({row.identity, row.trim, next, {},
+                    automatic && usesCapturedPeak(row) ? activeLearning : 0});
         }
         if (automatic)
         {
-            status = pending.empty()
-                ? utf8("Sem ajustes. Confira o sinal, o teto de pico e o limite de trim.")
-                : juce::String{};
+            if (!pending.empty())
+                status.clear();
+            else if (insufficient > 0 && skipped == insufficient)
+                status = utf8("Sem ajuste. Confira os bloqueios e capture um trecho com mais sinal.");
+            else if (skipped > insufficient)
+                status = utf8("Sem ajuste seguro com o teto de pico e o limite de trim atuais.");
+            else
+                status = utf8("Trim mantido. A pista já está na faixa ou no limite de trim.");
             return;
         }
         status = juce::String(commonCalibration ? utf8("Prévia de grupo: ajuste comum de ") + number(commonStep) + " dB. "
@@ -3134,7 +3173,9 @@ private:
             || (track->previewOwner != 0 && track->previewOwner != plugin.identity))
             return false;
         nx::Reading reading;
-        if (!track->measurement.read(reading, capturedSession) || !reading.active())
+        if (!track->measurement.read(reading, capturedSession)
+            || (!reading.active() && !(change.peakCaptureId != 0 && reading.learningId == change.peakCaptureId
+                && reading.learnedPeak > nx::floorDb)))
             return false;
         const auto truePeak = nx::db(*std::max_element(reading.inputLevels.truePeak.begin(),
                                                        reading.inputLevels.truePeak.end()));

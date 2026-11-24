@@ -214,9 +214,9 @@ inline constexpr std::array<PeakRange, 10> instrumentPeakRanges {{
 
 inline GainSuggestion suggestTrim(const Reading& reading, GainMode mode, float reference,
                                   Role role, float maxTrim, float headroom, int peakProfile = 0, float customPeak = 1.0f,
-                                  float ceiling = floorDb)
+                                  float ceiling = floorDb, bool capturedPeak = false)
 {
-    if (!reading.active())
+    if (!reading.active() && !capturedPeak)
         return {};
     float offset = 0;
     if (mode == GainMode::musical)

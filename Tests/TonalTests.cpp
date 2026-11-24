@@ -212,6 +212,27 @@ int main()
     styled.trim = -1;
     require(nx::smartGain(styled).suggestion.trim == -1, "Preserve Mix must not rebalance the user mix by style.");
 
+    for (const auto& preset : nx::presets)
+    {
+        if (preset.category == 7)
+            continue;
+        nx::SmartGainInput capture;
+        capture.category = preset.category;
+        capture.target = preset.target;
+        capture.instrumentCeiling = nx::instrumentPresetCeiling(preset);
+        capture.signal.peak = capture.maxSample = capture.ceiling = preset.target - 5;
+        require(!nx::smartGain(capture).sufficient, "A current silent window alone must not qualify for calibration.");
+        capture.capturedPeak = true;
+        require(near(nx::smartGain(capture).suggestion.trim, 5, 0.001),
+                "Every instrument and vocal preset must raise a quiet learned peak to its target.");
+        capture.signal.peak = capture.maxSample = capture.ceiling = preset.target + 5;
+        require(near(nx::smartGain(capture).suggestion.trim, -5, 0.001),
+                "Every instrument and vocal preset must attenuate a high learned peak.");
+        capture.maxSample = capture.instrumentCeiling + 8;
+        require(nx::smartGain(capture).suggestion.headroomUnmet,
+                "A captured peak above the ceiling must still be rejected if available trim cannot protect it.");
+    }
+
     const auto bus = nx::planGlobalHeadroom(-2, -1.4f, -6, -1, 1);
     require(bus.available && near(bus.suggested, -3, 0.01), "Global headroom must use the measured bus.");
     require(nx::planGlobalHeadroom(-20, -19, -6, -1, 0).suggested == 0, "Headroom manager must not raise a quiet mix.");

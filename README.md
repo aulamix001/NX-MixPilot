@@ -46,6 +46,8 @@ No balanço musical, a pista de **Foco** continua sendo a âncora. A análise to
 
 No editor **Track**, selecione o instrumento em **Referência de pico por instrumento**. O alvo e a faixa aparecem em dBFS de pico de amostra. Na calibração técnica por instrumento, o **ANALYZER** calcula o trim individual pela diferença entre o alvo e o pico medido antes do trim. Sem instrumento selecionado, usa a referência RMS ajustável. No Balanço musical, a faixa orienta a sugestão das pistas secundárias. Os limites de trim e headroom têm prioridade. Em Balanço musical, a pista de foco preserva sua função de âncora. A calibração em grupo com ganho comum prioriza preservar os níveis relativos. No HUB, o indicador de −6 dBFS é uma referência visual para o bus pré-master.
 
+Para calibrar bumbo e outras fontes com pausas, reproduza vários golpes dentro da janela do **Auto Gain**. A calibração técnica por pico considera os picos capturados mesmo que haja uma pausa no final. No Studio One, os inserts da pista medem e ajustam antes do fader. Mantenha o fader em 0 dB se quiser conferir no canal o mesmo nível da saída do insert, desde que não haja outro processamento depois dele. Para calibrar um sinal baixado antes do insert, ajuste o ganho do evento de áudio ou o nível de saída do instrumento virtual.
+
 ## Hierarquia de mix
 
 Em modo **Track**, deixe o papel em **Auto** ou **Acompanhamento** e escolha o tipo de acompanhamento. No **HUB**, escolha a pista **Principal** e clique em **ANALYZER**. O plugin usa o nível atual da Principal como âncora relativa em RMS. Estes são pontos de partida do MixPilot, ajustados pelos limites de trim e pico de amostra:
