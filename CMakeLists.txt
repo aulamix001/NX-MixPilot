@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(NXMixPilot VERSION 0.3.6 LANGUAGES C CXX)
+project(NXMixPilot VERSION 0.3.7 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -28,7 +28,8 @@ if(NX_BUILD_PLUGINS)
         PRODUCT_NAME "NX Audio MixPilot")
     target_sources(NXMixPilot PRIVATE Source/Plugin.cpp Source/Analysis.h Source/GlassLook.h Source/GainMeter.h Source/InstrumentPresets.h
         Source/TonalDSP.h Source/SpectralWorker.h Source/TonalPanel.h
-        Source/SmartGain.h Source/GainStyles.h Source/SmartPanel.h Source/ReferenceAudio.h Source/LoudnessMeter.h)
+        Source/SmartGain.h Source/GainStyles.h Source/SmartPanel.h Source/ReferenceAudio.h Source/LoudnessMeter.h
+        Source/ContinuousGain.h)
     target_compile_definitions(NXMixPilot PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_USE_MP3AUDIOFORMAT=1)
     target_link_libraries(NXMixPilot PRIVATE

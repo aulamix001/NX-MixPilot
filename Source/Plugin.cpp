@@ -1,4 +1,5 @@
 #include "Analysis.h"
+#include "ContinuousGain.h"
 #include "GlassLook.h"
 #include "InstrumentPresets.h"
 #include "SpectralWorker.h"
@@ -300,6 +301,10 @@ public:
         result.add(std::make_unique<AudioParameterBool>(ParameterID{"freeze", 1}, "Freeze", false));
         result.add(std::make_unique<AudioParameterFloat>(ParameterID{"trueCeiling", 1}, "Limite true peak (dBTP)",
                         NormalisableRange<float>{-18, 0, 0.1f}, -1));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"continuousGain", 1}, utf8("Ganho contínuo"), false));
+        result.add(std::make_unique<AudioParameterBool>(ParameterID{"safetyLimiter", 1}, utf8("Limitador de segurança"), false));
+        result.add(std::make_unique<AudioParameterFloat>(ParameterID{"limiterCeiling", 1}, "Teto do limitador (dBFS)",
+                        NormalisableRange<float>{-18, 0, 0.1f}, -1));
         for (std::size_t band = 0; band < toneFrequencies.size(); ++band)
         {
             const auto index = juce::String(band + 1);
@@ -465,6 +470,7 @@ public:
 
     bool eligible(int sessionId) const { return !hub() && session() == sessionId && value("bypass") < 0.5f; }
     bool volumeUnlocked() const { return value("volumeLock") < 0.5f && value("referenceOnly") < 0.5f; }
+    bool usesContinuousGain() const { return value("continuousGain") > 0.5f && !gainBus() && volumeUnlocked(); }
     bool eqUnlocked() const { return value("eqLock") < 0.5f && value("referenceOnly") < 0.5f; }
 
 
@@ -510,6 +516,7 @@ public:
         outputMeter.prepare(rate);
         inputLoudness.prepare(rate);
         outputLoudness.prepare(rate);
+        continuous.prepare(rate);
         gain.reset(rate, 0.035);
         outputGain.reset(rate, 0.035);
         outputGain.setCurrentAndTargetValue(1);
@@ -553,11 +560,17 @@ public:
             inputLoudness.reset();
             outputLoudness.reset();
             measurement.write({}, 0);
+            continuous.reset();
             settings = newSettings;
         }
 
-        const auto audition = previewSession.load() == sessionId && volumeUnlocked() ? preview.load() : noPreview;
+        const bool adaptiveGain = usesContinuousGain();
+        const auto audition = !adaptiveGain && previewSession.load() == sessionId && volumeUnlocked()
+            ? preview.load() : noPreview;
         const bool bypass = value("bypass") >= 0.5f;
+        continuous.configure(!bypass && adaptiveGain, value("freeze") > 0.5f, value("reference"),
+                             value("limit"), value("headroom"), !bypass && value("safetyLimiter") > 0.5f
+                             && value("referenceOnly") < 0.5f, value("limiterCeiling"));
         const float trim = isHub || bypass ? 0.0f : audition == noPreview ? value("trim") : audition;
         gain.setTargetValue(juce::Decibels::decibelsToGain(static_cast<double>(trim)));
         outputGain.setTargetValue(juce::Decibels::decibelsToGain(static_cast<double>(value("outputTrim"))));
@@ -587,15 +600,18 @@ public:
         nx::Reading reading;
         for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
         {
-            const auto clean = [](Sample value) { return std::isfinite(value) ? value : Sample{}; };
+            const auto clean = [](auto value) { return std::isfinite(value) ? value : decltype(value){}; };
             const auto dryLeft = clean(left[sample]);
             const auto dryRight = right ? clean(right[sample]) : dryLeft;
             const auto ramp = gain.getNextValue() * outputGain.getNextValue();
             const auto applied = bypass ? 1.0 : ramp;
             double equalizedLeft = dryLeft, equalizedRight = dryRight;
             equalizer.process(equalizedLeft, equalizedRight);
-            const auto wetLeft = clean(bypass ? dryLeft : static_cast<Sample>(equalizedLeft * applied));
-            const auto wetRight = clean(bypass ? dryRight : static_cast<Sample>(equalizedRight * applied));
+            auto processedLeft = clean(equalizedLeft * applied);
+            auto processedRight = clean(equalizedRight * applied);
+            continuous.process(processedLeft, processedRight);
+            const auto wetLeft = clean(bypass ? dryLeft : static_cast<Sample>(processedLeft));
+            const auto wetRight = clean(bypass ? dryRight : static_cast<Sample>(processedRight));
             left[sample] = wetLeft;
             if (right)
                 right[sample] = wetRight;
@@ -666,6 +682,8 @@ public:
                 measurement.write(reading, sessionId);
             }
         }
+        continuousDb.store(bypass ? 0 : static_cast<float>(continuous.gainDb()));
+        limitationDb.store(bypass ? 0 : static_cast<float>(continuous.reductionDb()));
     }
 
     juce::AudioProcessorValueTreeState parameters;
@@ -676,6 +694,7 @@ public:
     std::atomic<bool> toneBatch {false};
     std::atomic<unsigned> learningRequest {0};
     std::atomic<float> learningSensitivity {1};
+    std::atomic<float> continuousDb {0}, limitationDb {0};
     std::atomic<bool> holdReset {false};
     std::atomic<float> preview {noPreview};
     std::atomic<int> previewSession {0};
@@ -692,6 +711,7 @@ private:
     juce::String hostTrackName; // VST3 channel-context callbacks and the editor use the message thread.
     nx::Analyzer analyzer;
     nx::GainMeter inputMeter, outputMeter;
+    nx::ContinuousGain continuous;
     nx::LoudnessMeter inputLoudness, outputLoudness;
     juce::SmoothedValue<double> gain {1.0}, outputGain {1.0};
     std::array<unsigned, 85> learningHistogram {}, energyHistogram {};
@@ -718,6 +738,7 @@ struct TrackRow
     nx::SpectrumFrame spectrum;
     bool spectralCurrent = false;
     bool gainBus = false, tonalBus = false, volumeLocked = false, eqLocked = false, referenceOnly = false;
+    bool continuousGain = false;
     int priority = 50;
     nx::Function function = nx::Function::automatic;
     nx::SmartGainResult diagnostics;
@@ -778,6 +799,7 @@ public:
         attachSlider(learnTime, "learnTime", " s");
         attachSlider(sensitivity, "sensitivity", "");
         attachSlider(trueCeiling, "trueCeiling", " dBTP");
+        attachSlider(limiterCeiling, "limiterCeiling", " dBFS");
         targetPeak.textFromValueFunction = [](double v)
         {
             return v > 0 ? juce::String("Preset") : juce::String(v, 1);
@@ -1007,6 +1029,18 @@ public:
         addAndMakeVisible(freeze);
         freezeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
             plugin.parameters, "freeze", freeze);
+        continuousToggle.setButtonText(utf8("Ganho contínuo"));
+        continuousToggle.setTitle(continuousToggle.getButtonText());
+        continuousToggle.setTooltip(utf8("Ajusta pelo RMS de 0 VU. FREEZE segura o ganho atual."));
+        addAndMakeVisible(continuousToggle);
+        continuousAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+            plugin.parameters, "continuousGain", continuousToggle);
+        limiterToggle.setButtonText(utf8("Limitador de segurança"));
+        limiterToggle.setTitle(limiterToggle.getButtonText());
+        limiterToggle.setTooltip(utf8("Proteção de pico de amostra após o ganho de saída."));
+        addAndMakeVisible(limiterToggle);
+        limiterAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+            plugin.parameters, "safetyLimiter", limiterToggle);
         tonalExclude.setButtonText("Excluir do EQ");
         addAndMakeVisible(tonalExclude);
         tonalExcludeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -1074,6 +1108,9 @@ public:
         autoGain.setBounds(396, 802, 119, 28);
         freeze.setBounds(529, 802, 90, 28);
         resetHold.setBounds(629, 802, 96, 28);
+        continuousToggle.setBounds(732, 773, 149, 25);
+        limiterToggle.setBounds(732, 802, 164, 26);
+        limiterCeiling.setBounds(898, 803, 131, 26);
         analyze.setBounds(16, 652, 127, 34);
         review.setBounds(153, 652, 146, 34);
         audition.setBounds(309, 652, 116, 34);
@@ -1088,7 +1125,7 @@ public:
         setSize(1050, advanced ? 966 : 710);
         for (auto* control : std::initializer_list<juce::Component*>{
                  &category, &instruments, &targetPeak, &outputTrim, &learnTime, &sensitivity, &trueCeiling,
-                 &manualAnalyze, &autoGain, &freeze, &resetHold})
+                 &manualAnalyze, &autoGain, &freeze, &resetHold, &continuousToggle, &limiterToggle, &limiterCeiling})
             control->setVisible(advanced);
         resized();
         repaint();
@@ -1241,6 +1278,9 @@ public:
             label(g, "Janela", 719, 724, 139, 18, 12);
             label(g, "Sensibilidade", 869, 724, 154, 18, 12);
             label(g, "Limite True Peak", 17, 803, 101, 26, 12);
+            label(g, number(plugin.continuousDb.load()) + " dB", 893, 773, 136, 25, 12, cyan);
+            if (plugin.limitationDb.load() > 0.1f)
+                label(g, utf8("Redução: ") + number(plugin.limitationDb.load()) + " dB", 733, 830, 295, 15, 11, amber);
             const int preset = plugin.instrument();
             if (preset > 0)
                 label(g, utf8(nx::presets[preset - 1].name) + "  /  "
@@ -2664,7 +2704,8 @@ private:
 
     bool canSuggest(const TrackRow& row) const
     {
-        return !row.volumeLocked && !row.referenceOnly && row.current && row.reading.active() && (!needsAnchor() || focusRow >= 0);
+        return !row.continuousGain && !row.volumeLocked && !row.referenceOnly && row.current && row.reading.active()
+            && (!needsAnchor() || focusRow >= 0);
     }
 
     void timerCallback() override
@@ -2712,6 +2753,7 @@ private:
             row.volumeLocked = track.value("volumeLock") > 0.5f;
             row.eqLocked = track.value("eqLock") > 0.5f;
             row.referenceOnly = track.value("referenceOnly") > 0.5f;
+            row.continuousGain = track.usesContinuousGain();
             row.priority = static_cast<int>(track.value("priority"));
             row.function = static_cast<nx::Function>(static_cast<int>(track.value("function")));
             if (row.spectralCurrent)
@@ -2848,8 +2890,12 @@ private:
     {
         analyze.setToggleState(analyzing, juce::dontSendNotification);
         const bool writable = !analysisOnly.getToggleState() && plugin.value("bypass") < 0.5f;
-        analyze.setEnabled(writable && !freeze.getToggleState());
-        autoGain.setEnabled(writable && !freeze.getToggleState());
+        const bool staticGain = writable && !plugin.usesContinuousGain();
+        analyze.setEnabled(staticGain && !freeze.getToggleState());
+        autoGain.setEnabled(staticGain && !freeze.getToggleState());
+        continuousToggle.setEnabled(!plugin.gainBus() && plugin.volumeUnlocked());
+        limiterToggle.setEnabled(plugin.value("referenceOnly") < 0.5f);
+        limiterCeiling.setEnabled(limiterToggle.getToggleState());
         manualAnalyze.setEnabled(!analyzing);
         review.setEnabled(!analyzing);
         apply.setEnabled(writable && !analyzing && !pending.empty());
@@ -2867,7 +2913,8 @@ private:
 
     void startAnalysis(bool previewOnly = false)
     {
-        if (freeze.getToggleState() || (!previewOnly && analysisOnly.getToggleState()) || analyzing || plugin.value("bypass") > 0.5f)
+        if (freeze.getToggleState() || (!previewOnly && (analysisOnly.getToggleState() || plugin.usesContinuousGain()))
+            || analyzing || plugin.value("bypass") > 0.5f)
             return;
         discard(plugin.hub()
             ? utf8("ANALYZER  /  Mantenha o trecho em reprodução. O trim será aplicado a cada pista ativa.")
@@ -3109,7 +3156,7 @@ private:
         };
         const auto usable = [&](const TrackRow& row)
         {
-            if (!fresh(row) || row.volumeLocked || row.referenceOnly)
+            if (!fresh(row) || row.continuousGain || row.volumeLocked || row.referenceOnly)
                 return false;
             if (!automatic)
                 return canSuggest(row);
@@ -3222,7 +3269,7 @@ private:
         if (plugin.value("gainStyle") != capturedGainStyle)
             return false;
         auto* track = findTrack(change.identity);
-        if (track == nullptr || !track->eligible(capturedSession) || !track->volumeUnlocked()
+        if (track == nullptr || !track->eligible(capturedSession) || !track->volumeUnlocked() || track->usesContinuousGain()
             || std::abs(track->value("trim") - change.previous) > 0.011f
             || (track->previewOwner != 0 && track->previewOwner != plugin.identity))
             return false;
@@ -3391,12 +3438,13 @@ private:
     juce::Slider session, group, trim, reference, limit, trackLimit, headroom;
     juce::TextButton analyze, review, apply, audition, undo, cancel, analysisOnly;
     std::array<juce::ToggleButton, visibleRows> principalButtons;
-    juce::ToggleButton bypass, freeze, tonalExclude;
+    juce::ToggleButton bypass, freeze, tonalExclude, continuousToggle, limiterToggle;
     juce::TextButton manualAnalyze, autoGain, resetHold;
-    juce::Slider outputTrim, targetPeak, learnTime, sensitivity, trueCeiling;
+    juce::Slider outputTrim, targetPeak, learnTime, sensitivity, trueCeiling, limiterCeiling;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> choices;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliders;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment, freezeAttachment, tonalExcludeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> continuousAttachment, limiterAttachment;
     std::vector<TrackRow> rows;
     std::vector<Change> pending;
     nx::Reading local;

@@ -337,6 +337,43 @@ int main()
                 "The focus vocal insert audio must reach the target sample peak.");
     }
 
+    {
+        Plugin dynamics(createPluginFilter());
+        dynamics->prepareToPlay(rate, block);
+        std::unique_ptr<juce::AudioProcessorEditor> dynamicsEditor(dynamics->createEditor());
+        click(*dynamicsEditor, juce::String::fromUTF8("Avançado"));
+        require(findControl(*dynamicsEditor, juce::String::fromUTF8("Ganho contínuo")) != nullptr
+                && findControl(*dynamicsEditor, juce::String::fromUTF8("Limitador de segurança")) != nullptr,
+                "Both dynamics controls must be accessible in the advanced view.");
+        require(read(*dynamics, "continuousGain") == 0 && read(*dynamics, "safetyLimiter") == 0,
+                "Dynamics modules must be disabled for new instances.");
+        dynamics->setPlayHead(&playhead);
+        write(*dynamics, "continuousGain", 1);
+        for (int frame = 0; frame < 400; ++frame)
+        {
+            feed(*dynamics, playhead, signal, midi, 375, 0.08, true);
+            playhead.position += block;
+        }
+        require(std::abs(signal.getMagnitude(0, 0, block) - 0.15962) < 0.002,
+                "Continuous gain must actually raise the output of a quiet signal.");
+        write(*dynamics, "safetyLimiter", 1);
+        write(*dynamics, "limiterCeiling", -6);
+        feed(*dynamics, playhead, signal, midi, 375, 0.95, true);
+        require(signal.getMagnitude(0, block) <= 0.501188, "Limiter must bound the output of the insert.");
+        require(dynamics->getLatencySamples() == 0, "The sample-peak limiter must add zero latency.");
+        write(*dynamics, "bypass", 1);
+        feed(*dynamics, playhead, signal, midi, 375, 0.95, true);
+        require(std::abs(signal.getMagnitude(0, block) - 0.95) < 0.001,
+                "Bypass must exclude both processing stages.");
+        juce::MemoryBlock state;
+        dynamics->getStateInformation(state);
+        Plugin restored(createPluginFilter());
+        restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        require(read(*restored, "continuousGain") == 1 && read(*restored, "safetyLimiter") == 1
+                && std::abs(read(*restored, "limiterCeiling") + 6) < 0.02,
+                "The processing switches and ceiling must survive preset roundtrip.");
+    }
+
     const auto file = juce::File::createTempFile(".wav");
     {
         juce::WavAudioFormat format;

@@ -1,4 +1,5 @@
 #include "Analysis.h"
+#include "ContinuousGain.h"
 #include <cstdlib>
 #include <iostream>
 
@@ -154,5 +155,47 @@ int main()
         stereo.reset();
         expect(stereo.read().integrated == -120, "Reset must discard the previous loudness history.");
     }
-    std::cout << "Peak, RMS, VU, LUFS, calibration, group gain and spectral alignment passed.\n";
+    nx::ContinuousGain controller;
+    controller.prepare(48000);
+    double left = -0.3, right = 0.125;
+    controller.process(left, right);
+    expect(left == -0.3 && right == 0.125, "Disabled continuous gain and limiter must pass the signal.");
+    controller.configure(true, false, -18, 6, 3, false, -1);
+    for (int i = 0; i < 48000 * 4; ++i)
+    {
+        left = 0.05;
+        right = -left;
+        controller.process(left, right);
+    }
+    expect(near(static_cast<float>(controller.gainDb()), 6, 0.02f) && near(static_cast<float>(left), 0.1f, 0.001f)
+        && left == -right, "Continuous gain must approach its trim budget with stereo-linked gain.");
+    const auto learned = controller.gainDb();
+    controller.configure(true, true, -18, 6, 3, false, -1);
+    for (int i = 0; i < 48000; ++i)
+    {
+        left = 0.5;
+        right = left;
+        controller.process(left, right);
+    }
+    expect(near(static_cast<float>(controller.gainDb() - learned), 0, 0.01f), "Freeze must hold continuous gain.");
+    controller.configure(true, false, -18, 6, 3, false, -1);
+    for (int i = 0; i < 48000 * 2; ++i)
+    {
+        left = right = 0;
+        controller.process(left, right);
+    }
+    expect(left == 0 && right == 0 && near(static_cast<float>(controller.gainDb() - learned), 0, 0.01f),
+           "Gain must not rise or introduce audio during a pause.");
+    controller.reset();
+    controller.configure(false, false, -18, 6, 3, true, -6);
+    left = 2;
+    right = -0.5;
+    controller.process(left, right);
+    expect(near(static_cast<float>(left), 0.501187f, 0.00001f) && right == -left * 0.25,
+           "The limiter must bound the first sample and preserve the stereo ratio.");
+    left = 0.25;
+    right = left;
+    controller.process(left, right);
+    expect(left < 0.1 && left == right, "Limiter gain must release gradually after a transient.");
+    std::cout << "Peak, RMS, VU, LUFS, calibration, group gain, spectral alignment and dynamics passed.\n";
 }
