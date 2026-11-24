@@ -312,6 +312,29 @@ int main()
         require(std::abs(read(*backing, "trim") - 4.0f) < 0.05f, "HUB must use the distinct -16 dBFS backing preset.");
         require(std::abs(read(*piano, "trim") + 4.10f) < 0.05f, "HUB must attenuate a hot piano toward -14 dBFS.");
         require(std::abs(read(*bus, "trim")) < 0.02f, "Auto Gain must avoid processing a named bus again.");
+
+        write(*vocal, "trim", -4.4f);
+        write(*vocal, "limit", 4.4f);
+        write(*vocal, "role", 1);
+        std::unique_ptr<juce::AudioProcessorEditor> vocalEditor(vocal->createEditor());
+        pauseTimer();
+        click(*vocalEditor, "AUTO GAIN");
+        const auto vocalPeak = std::pow(10.0, -7.1 / 20.0);
+        for (int frame = 0; frame < 34; ++frame)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                feed(*vocal, playhead, signal, midi, 375, vocalPeak, false);
+                playhead.position += block;
+            }
+            juce::Thread::sleep(47);
+            juce::Timer::callPendingTimersSynchronously();
+        }
+        require(std::abs(read(*vocal, "trim") + 2.9f) < 0.02f,
+                "Track Auto Gain must replace an excessive previous trim on the focus vocal.");
+        feed(*vocal, playhead, signal, midi, 375, vocalPeak, false);
+        require(std::abs(signal.getMagnitude(0, block) - std::pow(10.0, -10.0 / 20.0)) < 0.001,
+                "The focus vocal insert audio must reach the target sample peak.");
     }
 
     const auto file = juce::File::createTempFile(".wav");

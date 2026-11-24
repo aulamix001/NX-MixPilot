@@ -42,7 +42,9 @@ struct SmartGainResult
 {
     GainSuggestion suggestion;
     float wanted = 0, permitted = 0, crest = 0;
+    float peakTarget = 1;
     bool sufficient = false;
+    bool trimLimited = false;
 };
 
 inline SmartGainResult smartGain(const SmartGainInput& input)
@@ -56,8 +58,6 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
             input.instrumentCeiling - std::max(signal.peak, input.maxSample) - input.downstreamGain);
     result.crest = std::max(0.0f, signal.peak - signal.rms);
     result.sufficient = signal.active() || input.capturedPeak;
-    if (!result.sufficient)
-        return result;
 
     const bool anchorRole = input.role == focus;
     auto role = input.role;
@@ -87,6 +87,13 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
     const float offset = anchorRole ? 0.0f : gainStyleOffset(input.style, lane);
     const float technicalTarget = input.stylePresetTarget && input.target <= 0
         ? input.target + offset * 0.5f : input.target;
+    if (technicalTarget <= 0)
+        result.peakTarget = technicalTarget;
+    else if (input.legacyPeakProfile > 0
+             && input.legacyPeakProfile <= static_cast<int>(instrumentPeakRanges.size()))
+        result.peakTarget = instrumentPeakRanges[static_cast<std::size_t>(input.legacyPeakProfile - 1)].target;
+    if (!result.sufficient)
+        return result;
 
     const auto peakShape = soundShape(input.category, result.crest);
     float desired = input.trim;
@@ -95,7 +102,7 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
         case GainStrategy::technical:
             desired = suggestTrim(signal, GainMode::calibration, input.anchor, role, 90, -90,
                                   input.legacyPeakProfile, technicalTarget, floorDb, input.capturedPeak).trim;
-            if (std::abs(desired - input.trim) <= tolerance(peakShape))
+            if (result.peakTarget > 0 && std::abs(desired - input.trim) <= tolerance(peakShape))
                 desired = input.trim;
             break;
         case GainStrategy::musical:
@@ -135,7 +142,9 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
     const bool musical = input.strategy == GainStrategy::musical;
     const auto floor = musical ? std::min(-input.limit, input.trim) : -input.limit;
     const auto upper = musical && anchorRole ? std::max(input.limit, input.trim) : input.limit;
-    const auto limited = std::max(floor, std::min({desired, upper, result.permitted}));
+    const auto safeDesired = std::min(desired, result.permitted);
+    const auto limited = std::clamp(safeDesired, floor, upper);
+    result.trimLimited = std::abs(safeDesired - limited) > 0.001f;
     result.suggestion = {limited, desired > result.permitted, limited > result.permitted + 0.001f};
     return result;
 }

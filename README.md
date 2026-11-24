@@ -48,6 +48,8 @@ No editor **Track**, selecione o instrumento em **Referência de pico por instru
 
 Para calibrar bumbo e outras fontes com pausas, reproduza vários golpes dentro da janela do **Auto Gain**. A calibração técnica por pico considera os picos capturados mesmo que haja uma pausa no final. No Studio One, os inserts da pista medem e ajustam antes do fader. Mantenha o fader em 0 dB se quiser conferir no canal o mesmo nível da saída do insert, desde que não haja outro processamento depois dele. Para calibrar um sinal baixado antes do insert, ajuste o ganho do evento de áudio ou o nível de saída do instrumento virtual.
 
+Na calibração técnica por instrumento, cada clique em **Auto Gain** recalcula o trim absoluto para o pico capturado. A tolerância de forma de sinal continua aplicável à calibração nominal por RMS e ao modo híbrido. **Automático (nome ou RMS)** mostra a referência resolvida pelo nome da pista. A leitura **Saída do insert** mostra o RMS e o pico após o MixPilot. Se o ganho necessário exceder o **Limite de trim**, o valor aplicado para no limite configurado.
+
 ## Hierarquia de mix
 
 Em modo **Track**, deixe o papel em **Auto** ou **Acompanhamento** e escolha o tipo de acompanhamento. No **HUB**, escolha a pista **Principal** e clique em **ANALYZER**. O plugin usa o nível atual da Principal como âncora relativa em RMS. Estes são pontos de partida do MixPilot, ajustados pelos limites de trim e pico de amostra:

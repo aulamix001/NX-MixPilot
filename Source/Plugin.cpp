@@ -233,7 +233,7 @@ public:
 
     static juce::StringArray peakNames()
     {
-        return {utf8("Sem referência de pico"), "Kick", "Snare", utf8("Hi-hat / Percussão"), "Baixo",
+        return {utf8("Automático (nome ou RMS)"), "Kick", "Snare", utf8("Hi-hat / Percussão"), "Baixo",
                 "Piano / Teclados", "Guitarras", "Pads / Strings", "Sintetizadores",
                 "Vocal principal", "Backing vocals"};
     }
@@ -1181,13 +1181,20 @@ public:
                   28, 526, 641, 25, 14);
             label(g, "Tipo de acompanhamento", 28, 553, 270, 20, 12);
             label(g, utf8("Referência de pico por instrumento"), 324, 553, 350, 20, 12);
-            const int profile = static_cast<int>(plugin.value("peakReference"));
-            if (profile > 0)
+            if (!rows.empty() && strategy() == nx::GainStrategy::technical)
             {
-                const auto range = nx::instrumentPeakRanges[static_cast<std::size_t>(profile - 1)];
-                label(g, "Alvo: " + number(range.target) + " dBFS pico  /  Faixa: " + number(range.minimum) + " a " + number(range.maximum),
-                      325, 605, 348, 19, 12, cyan);
+                const auto& row = rows.front();
+                const auto target = row.diagnostics.peakTarget;
+                const auto preset = row.instrument > 0 && row.peakProfile == 0 && row.customPeak > 0
+                    ? utf8(nx::presets[row.instrument - 1].name) + "  /  " : juce::String{};
+                const auto referenceText = target <= 0 ? preset + "Alvo de pico: " + number(target) + " dBFS"
+                    : utf8("Referência RMS: ") + number(plugin.value("reference")) + " dBFS";
+                label(g, referenceText, 325, 602, 356, 18, 12, cyan);
             }
+            const auto meterRms = std::hypot(local.outputLevels.rms[0], local.outputLevels.rms[1]) / std::sqrt(2.0f);
+            label(g, utf8("Saída do insert  /  ") + (localSignal()
+                ? "RMS " + number(nx::db(meterRms)) + " dBFS   Pico " + number(local.outputPeak) + " dBFS"
+                : utf8("—")), 28, 619, 647, 15, 12, cyan);
             label(g, utf8("SESSÃO E GRUPO"), 721, 411, 297, 19, 14, cyan, true);
             label(g, utf8("Sessão ") + juce::String(plugin.session()) + "  /  Grupo " + juce::String(plugin.group()),
                   721, 436, 297, 25, 15, ink);
@@ -2545,10 +2552,10 @@ private:
     {
         const auto selected = static_cast<unsigned>(pick.getSelectedId());
         label(g, "Pista", 34, 428, 130, 16, 11);
-        label(g, "RMS dBFS", 248, 428, 68, 16, 11);
+        label(g, "RMS entrada", 248, 428, 78, 16, 11);
         if (plugin.hub())
             label(g, "Ver", 216, 428, 25, 16, 11, cyan);
-        label(g, "Pico dBFS", 327, 428, 68, 16, 11);
+        label(g, "Pico entrada", 327, 428, 78, 16, 11);
         if (plugin.hub() && tonalPanel.isVisible())
             label(g, "EQ", 386, 428, 23, 16, 11, cyan);
         label(g, "Sug. dB", 413, 428, 60, 16, 11);
@@ -2600,7 +2607,8 @@ private:
             }
             const juce::String state = !signal ? "Sem sinal" : !row.reading.active() ? "Medindo"
                 : row.proposed.headroomUnmet ? "Margem insuficiente"
-                : row.proposed.headroomLimited ? "Limitado pelo pico" : row.adjusted ? "Ajustada" : "Ativo";
+                : row.proposed.headroomLimited ? "Limitado pelo pico"
+                : row.diagnostics.trimLimited && canSuggest(row) ? "Limite de trim" : row.adjusted ? "Ajustada" : "Ativo";
             label(g, state, 557, top, plugin.hub() ? 90 : 123, 28, 12, row.proposed.headroomLimited ? amber : muted);
         }
     }
@@ -2954,11 +2962,11 @@ private:
     {
         const auto anchor = currentAnchor(false);
         for (auto& row : rows)
+        {
+            row.diagnostics = diagnoseGain(row, anchor, false);
             if (canSuggest(row))
-            {
-                row.diagnostics = diagnoseGain(row, anchor, false);
                 row.proposed = row.diagnostics.suggestion;
-            }
+        }
     }
 
     static nx::StyleLane styleLane(const TrackRow& row)
@@ -3080,6 +3088,7 @@ private:
         const auto anchor = currentAnchor(automatic);
         int skipped = 0;
         int insufficient = 0;
+        bool hitTrimLimit = false;
         capturedSession = plugin.session();
         capturedHub = plugin.hub();
         capturedGainStyle = plugin.value("gainStyle");
@@ -3126,6 +3135,7 @@ private:
                 continue;
             }
             const auto diagnosis = diagnoseGain(row, anchor, automatic);
+            hitTrimLimit |= diagnosis.trimLimited;
             if (!commonCalibration && diagnosis.suggestion.headroomUnmet)
             {
                 ++skipped;
@@ -3152,8 +3162,10 @@ private:
                 status = utf8("Sem ajuste. Confira os bloqueios e capture um trecho com mais sinal.");
             else if (skipped > insufficient)
                 status = utf8("Sem ajuste seguro com o teto de pico e o limite de trim atuais.");
+            else if (hitTrimLimit)
+                status = utf8("Trim mantido no limite de ") + number(plugin.value("limit")) + " dB.";
             else
-                status = utf8("Trim mantido. A pista já está na faixa ou no limite de trim.");
+                status = utf8("Trim mantido. A captura já está na referência ou na faixa de tolerância.");
             return;
         }
         status = juce::String(commonCalibration ? utf8("Prévia de grupo: ajuste comum de ") + number(commonStep) + " dB. "
@@ -3258,10 +3270,12 @@ private:
         }
         clearPreview();
         const auto count = pending.size();
+        const auto trackTrim = pending.front().next;
         plugin.redoHistory.clear();
         plugin.history.push_back(std::move(pending));
         pending.clear();
-        status = juce::String(count) + " trims internos aplicados. Desfazer restaura os valores anteriores.";
+        status = capturedHub ? juce::String(count) + " trims internos aplicados. Desfazer restaura os valores anteriores."
+            : utf8("Trim aplicado: ") + number(trackTrim) + utf8(" dB. Confira a saída do insert ou use Desfazer.");
     }
 
     void undoLast()

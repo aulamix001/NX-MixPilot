@@ -119,6 +119,21 @@ int main()
     input.limit = 12;
     const auto firstPass = nx::smartGain(input);
     require(near(firstPass.suggestion.trim, 6, 0.01), "Smart gain must work from original signal.");
+    auto vocal = input;
+    vocal.category = 6;
+    vocal.role = nx::focus;
+    vocal.target = -10;
+    vocal.instrumentCeiling = -6;
+    vocal.signal.rms = -21.6f;
+    vocal.signal.peak = -7.1f;
+    vocal.trim = -4.4f;
+    vocal.limit = 4.4f;
+    require(near(nx::smartGain(vocal).suggestion.trim, -2.9f, 0.001),
+            "Explicit technical peak calibration must refine a previously applied vocal trim within the limit.");
+    vocal.signal.peak = -25;
+    const auto quietVocal = nx::smartGain(vocal);
+    require(quietVocal.trimLimited && near(quietVocal.suggestion.trim, 4.4f, 0.001),
+            "The technical calibration must report when maximum trim prevents a full correction.");
     input.trim = firstPass.suggestion.trim;
     require(nx::smartGain(input).suggestion.trim == input.trim, "Reanalysis must not accumulate or reapply trim.");
     input.strategy = nx::GainStrategy::preserve;
