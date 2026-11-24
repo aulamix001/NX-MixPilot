@@ -1,5 +1,6 @@
 #include "TonalDSP.h"
 #include "SmartGain.h"
+#include "InstrumentPresets.h"
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -129,6 +130,52 @@ int main()
     input.signal.settled = false;
     require(!nx::smartGain(input).sufficient && nx::smartGain(input).suggestion.trim == input.trim,
             "Hybrid must abstain if activity is insufficient.");
+    input.signal.settled = true;
+    input.strategy = nx::GainStrategy::musical;
+    input.signal.rms = -46;
+    input.signal.peak = -39;
+    input.anchor = -19;
+    input.ceiling = -39;
+    input.role = nx::music;
+    input.target = 1;
+    input.trim = 6;
+    require(nx::smartGain(input).suggestion.trim == 0, "Quiet guitar must lose an old boost instead of retaining it.");
+    input.trim = -9;
+    input.limit = 6;
+    require(nx::smartGain(input).suggestion.trim == -9, "Musical balance must retain stronger prior attenuation.");
+    input.signal.rms = -18;
+    input.trim = 0;
+    require(nx::smartGain(input).suggestion.trim == -6, "An audible accompaniment must be attenuated relative to the focus.");
+    input.role = nx::focus;
+    input.trim = -4.7f;
+    require(nx::smartGain(input).suggestion.trim == input.trim, "Musical balance must preserve a safe focus trim.");
+    input.ceiling = 3;
+    require(nx::smartGain(input).suggestion.trim == -6, "Focus still needs reduction if its measured peak requires headroom.");
+    input.signal.learnedActiveWindows = 20;
+    input.signal.learnedEnergy = -24;
+    input.signal.learnedLoudEnergy = -13;
+    require(nx::musicalRms(input.signal, true, true, -2) == -26
+        && nx::musicalRms(input.signal, false, true, 1) == -12,
+        "Musical analysis must distinguish the anchor median and louder accompaniment windows, including output gain.");
+
+    input.role = nx::music;
+    input.signal.rms = -46;
+    input.signal.peak = -39;
+    input.trim = 6;
+    input.limit = 24;
+    input.ceiling = -11;
+    input.instrumentCeiling = -10;
+    input.maxSample = -6;
+    input.downstreamGain = 2;
+    require(nx::smartGain(input).suggestion.trim == -6,
+            "The highest learned sample peak and gain after trim must count toward the instrument ceiling.");
+    input.limit = 3;
+    require(nx::smartGain(input).suggestion.headroomUnmet,
+            "A preset that cannot reach its ceiling inside the trim limit must flag insufficient range.");
+    require(nx::instrumentPresetCeiling(nx::presets[0]) == -6 &&
+            nx::instrumentPresetCeiling({"Guitarra clean", 3, -14}) == -10,
+            "Instrument ceilings must use the project's starter ranges.");
+
     const auto bus = nx::planGlobalHeadroom(-2, -1.4f, -6, -1, 1);
     require(bus.available && near(bus.suggested, -3, 0.01), "Global headroom must use the measured bus.");
     require(nx::planGlobalHeadroom(-20, -19, -6, -1, 0).suggested == 0, "Headroom manager must not raise a quiet mix.");

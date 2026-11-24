@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 namespace nx
 {
 struct InstrumentPreset { const char* name; int category; float target; };
@@ -125,4 +127,27 @@ inline constexpr InstrumentPreset presets[] {
     {"Backing Bus", 7, -12},
     {"Mix Bus pré-master", 7, -6},
 };
+
+// The upper edges of the starter ranges supplied for this project. Catalog-only
+// entries use a 3 dB allowance above their preset target.
+constexpr float instrumentPresetCeiling(const InstrumentPreset& preset)
+{
+    const std::string_view name(preset.name);
+    if (name == "Kick" || name == "Snare" || preset.category == 1)
+        return -6;
+    if (name.find("Hi-hat") == 0)
+        return -12;
+    if (preset.category == 2 || preset.category == 3 || name.find("Backing") == 0)
+        return preset.target + 4 < -10 ? preset.target + 4 : -10;
+    if (name.find("Pad ") == 0)
+        return -12;
+    if (name.find("Synth ") == 0)
+        return preset.target + 4 < -8 ? preset.target + 4 : -8;
+    if (name.find("Vocal principal") == 0)
+        return -6;
+    if (preset.category == 7)
+        return preset.target;
+    return preset.target + 3;
+}
+
 }

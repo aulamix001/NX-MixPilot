@@ -34,9 +34,9 @@ struct Reading
     float outputPeak = floorDb;
     float activeRms = floorDb, activity = 0;
     StereoLevels inputLevels {}, outputLevels {};
-    float learnedPeak = floorDb, learnedCeiling = floorDb;
+    float learnedPeak = floorDb, learnedCeiling = floorDb, learnedMaxSample = floorDb;
     unsigned learningId = 0, learnedActiveWindows = 0;
-    float learnedEnergy = floorDb;
+    float learnedEnergy = floorDb, learnedLoudEnergy = floorDb;
     int sampleRate = 0;
     bool settled = false;
     std::int64_t position = -1;

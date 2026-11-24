@@ -162,6 +162,34 @@ int main()
     click(*suggestion->getParentComponent(), "Desfazer EQ");
     require(std::abs(read(*second, "toneG1")) < 1.0e-5f, "Undo did not restore the original EQ.");
 
+    require(editor->getHeight() == 710, "The editor should start in the essential view.");
+    click(*editor, juce::String::fromUTF8("Avançado"));
+    require(editor->getHeight() == 966 && findControl(*editor, "RESET") != nullptr,
+            "Advanced controls must stay accessible after switching views.");
+    click(*editor, "Essencial");
+    require(editor->getHeight() == 710 && findControl(*editor, "RESET") == nullptr,
+            "The essential view must hide only the advanced controls.");
+    click(*editor, "Tonal Match"); // Close the tonal panel before adjusting gain.
+    write(*first, "trim", -4.7f);
+    write(*second, "trim", 6);
+    click(*editor, "AUTO GAIN");
+    for (int frame = 0; frame < 34; ++frame)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            feed(*first, playhead, signal, midi, 996.09375, 0.12, false);
+            feed(*second, playhead, signal, midi, 996.09375, frame < 17 ? 0.5 : 0.011, true);
+            feed(*hub, playhead, signal, midi, 1253.90625, 0.18, false);
+            playhead.position += block;
+        }
+        juce::Thread::sleep(47);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    require(std::abs(read(*first, "trim") + 4.7f) < 0.02f,
+            "Musical Auto Gain must leave a safe focus level unchanged.");
+    require(read(*second, "trim") <= -3.9f,
+            "Musical Auto Gain must use the learned loud passage and guitar ceiling even when the final window is quiet.");
+
     const auto file = juce::File::createTempFile(".wav");
     {
         juce::WavAudioFormat format;

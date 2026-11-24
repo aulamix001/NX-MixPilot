@@ -30,6 +30,7 @@ struct SmartGainInput
     Function function = Function::automatic;
     int category = 2, priority = 50, legacyPeakProfile = 0;
     float trim = 0, target = 1, anchor = nominalRms, limit = 6, margin = 3, ceiling = floorDb;
+    float instrumentCeiling = 1, maxSample = floorDb, downstreamGain = 0;
 };
 
 struct SmartGainResult
@@ -45,6 +46,9 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
     const auto& signal = input.signal;
     result.suggestion.trim = result.wanted = input.trim;
     result.permitted = -input.margin - std::max(signal.peak, input.ceiling);
+    if (input.instrumentCeiling <= 0)
+        result.permitted = std::min(result.permitted,
+            input.instrumentCeiling - std::max(signal.peak, input.maxSample) - input.downstreamGain);
     result.crest = std::max(0.0f, signal.peak - signal.rms);
     result.sufficient = signal.active();
     if (!result.sufficient)
@@ -75,19 +79,27 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
                 desired = input.trim;
             break;
         case GainStrategy::musical:
+            // Anchor the focal track at the current level. Balance the other
+            // tracks by attenuation so a quiet section cannot grant a boost
+            // that will carry into the louder sections of the song.
+            if (!anchorRole)
+            {
+                const auto musical = suggestTrim(signal, GainMode::musical, input.anchor, role, 90, -90,
+                                                 input.legacyPeakProfile, input.target).trim;
+                desired = std::min({musical, input.trim, 0.0f});
+            }
+            break;
         case GainStrategy::hybrid:
         {
             const auto musical = suggestTrim(signal, GainMode::musical, input.anchor, role, 90, -90,
                                              input.legacyPeakProfile, input.target).trim;
             desired = musical;
-            if (input.strategy == GainStrategy::hybrid && !anchorRole)
+            if (!anchorRole)
             {
                 const auto technical = suggestTrim(signal, GainMode::calibration, nominalRms, role, 90, -90,
                                                     input.legacyPeakProfile, input.target).trim;
                 const float qualifier = peakShape == SoundShape::transient ? 0.25f : 0.65f;
                 const float absoluteCandidate = technical + qualifier * (musical - technical);
-                // Priority weighs the musical candidate against the technical one.
-                // Both are absolute proposals measured before trim, so reanalysis does not accumulate gain.
                 const float musicalWeight = static_cast<float>(std::clamp(input.priority, 0, 100)) / 100.0f;
                 desired = absoluteCandidate + musicalWeight * (musical - absoluteCandidate);
                 if (std::abs(desired - input.trim) <= tolerance(peakShape))
@@ -100,9 +112,25 @@ inline SmartGainResult smartGain(const SmartGainInput& input)
     }
 
     result.wanted = desired;
-    const auto limited = std::max(-input.limit, std::min({desired, input.limit, result.permitted}));
+    const bool musical = input.strategy == GainStrategy::musical;
+    const auto floor = musical ? std::min(-input.limit, input.trim) : -input.limit;
+    const auto upper = musical && anchorRole ? std::max(input.limit, input.trim) : input.limit;
+    const auto limited = std::max(floor, std::min({desired, upper, result.permitted}));
     result.suggestion = {limited, desired > result.permitted, limited > result.permitted + 0.001f};
     return result;
+}
+
+inline float musicalRms(const Reading& source, bool isFocus, bool useLearned, float outputTrim)
+{
+    if (useLearned && source.learnedActiveWindows >= 4)
+    {
+        const auto learned = isFocus ? source.learnedEnergy : source.learnedLoudEnergy;
+        if (learned > floorDb)
+            return learned + outputTrim;
+    }
+    if (!isFocus && source.activity >= 0.15f)
+        return std::max(source.activeRms, source.rms) + outputTrim;
+    return source.rms + outputTrim;
 }
 
 struct GlobalHeadroom
